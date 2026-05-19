@@ -348,10 +348,13 @@ phase_pre_checkpoint() {
     skip "sprite-env not on PATH; skipping pre-setup checkpoint"
     return 0
   fi
-  local label="pre-setup-$(date +%s)"
-  info "creating sprite checkpoint '$label'..."
-  if quiet pre-checkpoint sprite-env checkpoint create --name "$label"; then
-    ok "pre-setup checkpoint '$label' created"
+  # sprite-env auto-assigns checkpoint IDs (v0, v1, v2 ...); --comment attaches
+  # a human-readable label so we can find it in `sprite-env checkpoints list`.
+  local label
+  label="pre-setup-$(date +%s)"
+  info "creating sprite checkpoint (--comment '$label')..."
+  if quiet pre-checkpoint sprite-env checkpoints create --comment "$label"; then
+    ok "pre-setup checkpoint created (label: $label)"
   else
     warn "pre-setup checkpoint failed (continuing anyway)"
   fi
@@ -363,10 +366,11 @@ phase_post_checkpoint() {
     skip "sprite-env not on PATH; skipping post-setup checkpoint"
     return 0
   fi
-  local label="post-setup-$(date +%s)"
-  info "creating sprite checkpoint '$label'..."
-  if quiet post-checkpoint sprite-env checkpoint create --name "$label"; then
-    ok "post-setup checkpoint '$label' created"
+  local label
+  label="post-setup-$(date +%s)"
+  info "creating sprite checkpoint (--comment '$label')..."
+  if quiet post-checkpoint sprite-env checkpoints create --comment "$label"; then
+    ok "post-setup checkpoint created (label: $label)"
   else
     warn "post-setup checkpoint failed (continuing anyway)"
   fi
@@ -1198,9 +1202,10 @@ phase_clone_repos() {
   return 0
 }
 
-# phase_garlic_defaults — run `garlic --defaults` to populate garlic-managed
-# config. We can't know exactly which files garlic writes, so we use a
-# sentinel file under our own state dir and skip if it exists (unless --force).
+# phase_garlic_defaults — apply garlic's built-in defaults non-interactively.
+# `garlic setup --defaults -y` installs Claude hooks, the /garlic slash
+# command, the nudge-relay CLAUDE.md instruction, and resets garlic's config
+# to defaults. Idempotent (running again just resets the same files).
 phase_garlic_defaults() {
   if ! command -v garlic >/dev/null 2>&1; then
     warn "garlic not on PATH; run --only garlic first"
@@ -1211,12 +1216,12 @@ phase_garlic_defaults() {
     skip "garlic defaults already applied (sentinel: $sentinel; --force to reapply)"
     return 0
   fi
-  info "running 'garlic --defaults'..."
-  if quiet garlic-defaults garlic --defaults; then
+  info "running 'garlic setup --defaults -y'..."
+  if quiet garlic-defaults garlic setup --defaults -y; then
     date -u +%Y-%m-%dT%H:%M:%SZ > "$sentinel"
-    ok "garlic defaults applied"
+    ok "garlic defaults applied (hooks + /garlic command + CLAUDE.md instruction)"
   else
-    warn "garlic --defaults returned non-zero (continuing)"
+    return 1
   fi
   return 0
 }
