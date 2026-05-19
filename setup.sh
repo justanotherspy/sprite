@@ -199,7 +199,7 @@ export PATH="$HOME/.local/bin:$HOME/.fly/bin:$PATH"
 phase_apt_core() {
   local needed=(
     apt-transport-https software-properties-common lsb-release
-    shellcheck bat btop direnv fd-find fzf mosh ncdu neovim
+    shellcheck bat btop direnv fd-find fzf jq mosh ncdu neovim
     netcat-openbsd ripgrep traceroute yq xclip
   )
   local missing=()
