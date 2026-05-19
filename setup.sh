@@ -195,7 +195,7 @@ PHASES=(
   uv black garlic pre_commit ruff semgrep
   cosign trufflehog dive gitleaks hadolint
   docker dockerd_service flyctl
-  claude_upgrade claude_settings
+  claude_upgrade claude_statusline claude_settings
   pre_commit_template gitignore_global
   ssh_known_hosts git_identity ssh_key
   gh_auth gh_upload_keys git_signing
@@ -775,28 +775,103 @@ phase_claude_upgrade() {
   return 0
 }
 
+# phase_claude_statusline — install ~/.claude/statusline.py.
+# Prefers a local copy if setup.sh was launched from a clone (so the script
+# and statusline.py are sitting next to each other on disk); otherwise falls
+# back to fetching from main, same pattern phase_verify uses for
+# _lib_verify.sh. Validates the result parses as Python before leaving it
+# in place.
+phase_claude_statusline() {
+  local dest_dir="$HOME/.claude"
+  local dest="$dest_dir/statusline.py"
+  mkdir -p "$dest_dir"
+
+  local script_path script_dir local_src
+  script_path="${BASH_SOURCE[0]:-$0}"
+  script_dir="$(cd "$(dirname "$script_path" 2>/dev/null)" 2>/dev/null && pwd || echo "")"
+  local_src="$script_dir/statusline.py"
+
+  # Idempotency: if dest matches the local source (when we have one), skip.
+  # When no local source is available, only skip if dest is present and
+  # parses; that way --force still always refetches.
+  if [[ -f "$dest" && $FORCE -ne 1 ]]; then
+    if [[ -f "$local_src" ]] && cmp -s "$local_src" "$dest"; then
+      skip "$dest already current (matches $local_src)"
+      return 0
+    fi
+    if [[ ! -f "$local_src" ]] \
+       && python3 -c "import py_compile; py_compile.compile('$dest', doraise=True)" >/dev/null 2>&1; then
+      skip "$dest already present (no local source to diff; --force to refetch)"
+      return 0
+    fi
+  fi
+
+  if [[ -f "$local_src" ]]; then
+    info "installing statusline.py from local source ($local_src)"
+    install -m 0755 "$local_src" "$dest" || return 1
+  else
+    info "fetching statusline.py from raw.githubusercontent.com (main)"
+    quiet statusline-download \
+      curl -fsSL \
+        "https://raw.githubusercontent.com/justanotherspy/sprite/main/statusline.py" \
+        -o "$dest" || return 1
+    chmod 0755 "$dest"
+  fi
+
+  if ! python3 -c "import py_compile; py_compile.compile('$dest', doraise=True)" >/dev/null 2>&1; then
+    err "$dest does not parse as Python; refusing to leave it in place"
+    return 1
+  fi
+  ok "installed $dest"
+  return 0
+}
+
 phase_claude_settings() {
   local settings_dir="$HOME/.claude"
   local settings_file="$settings_dir/settings.json"
   mkdir -p "$settings_dir"
 
-  if [[ -f "$settings_file" && $FORCE -ne 1 ]]; then
-    if [[ "$(jq -r '.tui // ""' "$settings_file" 2>/dev/null)" == "fullscreen" ]]; then
-      skip "$settings_file already has tui=fullscreen"
-      return 0
-    fi
+  # Top-level keys we manage. Excludes "hooks" (the sprite base image ships
+  # those). The statusLine.command path resolves at write time, which on a
+  # sprite is always /home/sprite/.claude/statusline.py.
+  local desired
+  desired=$(cat <<JSON
+{
+  "permissions": {"defaultMode": "bypassPermissions"},
+  "tui": "fullscreen",
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "dark",
+  "statusLine": {
+    "type": "command",
+    "command": "python3 ${HOME}/.claude/statusline.py"
+  }
+}
+JSON
+)
+
+  # Idempotency: deep-merging $want into the current file should be a no-op
+  # if every managed key is already correct. This is stricter than a simple
+  # tui check and tolerates extra keys (e.g. the sprite's hooks).
+  if [[ -f "$settings_file" && $FORCE -ne 1 ]] \
+     && jq -e --argjson want "$desired" '($. * $want) == $.' \
+            "$settings_file" >/dev/null 2>&1; then
+    skip "$settings_file already has all managed keys"
+    return 0
   fi
 
   local tmp
   tmp="$(mktemp)"
-  if [[ -f "$settings_file" && -s "$settings_file" ]]; then
-    jq '. + {tui: "fullscreen"}' "$settings_file" > "$tmp"
+  if [[ -f "$settings_file" && -s "$settings_file" ]] \
+     && jq -e . "$settings_file" >/dev/null 2>&1; then
+    jq --argjson want "$desired" '. * $want' "$settings_file" > "$tmp" \
+      || { rm -f "$tmp"; return 1; }
   else
-    printf '{"tui":"fullscreen"}\n' | jq . > "$tmp"
+    printf '%s\n' "$desired" | jq . > "$tmp" \
+      || { rm -f "$tmp"; return 1; }
   fi
   mv "$tmp" "$settings_file"
   chmod 644 "$settings_file"
-  ok "set tui=fullscreen in $settings_file"
+  ok "updated $settings_file (permissions, tui, skipDangerousModePermissionPrompt, theme, statusLine)"
   return 0
 }
 
@@ -1508,6 +1583,7 @@ run_phase docker               phase_docker
 run_phase dockerd_service      phase_dockerd_service
 run_phase flyctl               phase_flyctl
 run_phase claude_upgrade       phase_claude_upgrade
+run_phase claude_statusline    phase_claude_statusline
 run_phase claude_settings      phase_claude_settings
 run_phase pre_commit_template  phase_pre_commit_template
 run_phase gitignore_global     phase_gitignore_global
