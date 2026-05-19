@@ -2,54 +2,100 @@
 #
 # dev-env-setup.sh
 # Personal dev environment bootstrap for sprite.dev sprites.
+# Owner: Daniel Schwartz <danielschwar@gmail.com> (justanotherspy)
 #
-# Target: Ubuntu 25.10 (questing) on a sprite.dev sprite (overlay rootfs, PID 1
-# is tini, no systemd). Verified pre-installed by sprite (do NOT reinstall):
-#   - languages: node, npm, deno, python3, pip, ruby, gem, rustc, cargo,
-#     rustup, elixir, mix, java, javac, bun, go (all under /.sprite/bin/)
-#   - CLIs: gh, claude, gemini, codex
-#   - classics: git, curl, wget, vim, nano, tmux, jq, htop, tree, dig,
-#     bash, zsh, fish, make, pkg-config, rsync, less, man, unzip, zip,
-#     tar, xz, iputils-ping, net-tools
+# Target: Ubuntu 25.10 (questing) on a sprite.dev sprite.
+# (overlay rootfs, PID 1 is tini, no systemd)
 #
-# Runs OK as either root or the sprite user. Idempotent (sentinel-wrapped
-# rc edits, conditional installs). No systemd means service starts are
-# skipped during script run; we register a sprite Service for dockerd
-# so it comes back on wake.
+# Idempotent: safe to re-run. Each phase self-checks before doing work.
+#   --force         redo every phase even if it looks already done
+#   --only PHASE    run a single phase (see --help for the list)
 #
 set -euo pipefail
 
-# --- output logging ---------------------------------------------------------
-# Mirror all stdout/stderr to a log file with ANSI colors stripped, so the
-# log is paste-friendly. The terminal still gets colored output. Override
-# via LOG_FILE env var if you want a custom path.
+# ============================================================================
+# Pinned identity (FrootLoops / Daniel Schwartz)
+# ============================================================================
+GIT_USER_NAME="Daniel Schwartz"
+GIT_USER_EMAIL="danielschwar@gmail.com"
+GIT_DEFAULT_BRANCH="main"
+GH_USERNAME="justanotherspy"
+
+# ============================================================================
+# Logging
+# ============================================================================
 LOG_FILE="${LOG_FILE:-/tmp/dev-env-setup.log}"
 exec > >(stdbuf -oL tee >(stdbuf -oL sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' > "$LOG_FILE")) 2>&1
-# Single EXIT handler that:
-#   1. kills the sudo keepalive (if it was started)
-#   2. gives the tee/sed subprocess a beat to flush the last lines to disk.
 _finalize() {
-  if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
-    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
-  fi
+  [[ -n "${SUDO_KEEPALIVE_PID:-}" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
   sleep 0.3
 }
 trap _finalize EXIT
-echo "[Output mirrored to $LOG_FILE — when done, run: cat $LOG_FILE]"
+echo "[Output mirrored to $LOG_FILE]"
 echo
 
-# --- logging ----------------------------------------------------------------
-RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
-BLUE=$'\033[34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
-log()  { printf "%s%s==>%s %s\n" "$BLUE" "$BOLD" "$RESET" "$*"; }
+RED=$'\033[31m';  GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+BLUE=$'\033[34m'; GREY=$'\033[90m';  BOLD=$'\033[1m'; RESET=$'\033[0m'
+log()  { printf "\n%s%s==>%s %s\n" "$BLUE" "$BOLD" "$RESET" "$*"; }
 info() { printf "    %s\n" "$*"; }
 warn() { printf "%s!%s %s\n" "$YELLOW" "$RESET" "$*"; }
 err()  { printf "%sx%s %s\n" "$RED" "$RESET" "$*" >&2; }
 ok()   { printf "%s+%s %s\n" "$GREEN" "$RESET" "$*"; }
+skip() { printf "%s-%s %s%s%s\n" "$GREY" "$RESET" "$GREY" "$*" "$RESET"; }
 
-# --- preflight --------------------------------------------------------------
-# Allow running as root OR a normal user. Wrap privileged calls in $SUDO so
-# they work either way without a useless 'sudo sudo'.
+# ============================================================================
+# CLI flags
+# ============================================================================
+FORCE=0
+ONLY_PHASE=""
+PHASES=(
+  apt_core corepack uv semgrep trufflehog
+  docker dockerd_service flyctl
+  ssh_known_hosts git_identity ssh_key
+  gh_auth gh_upload_keys git_signing
+  rc_additions
+)
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) FORCE=1; shift ;;
+    --only)  ONLY_PHASE="${2:-}"; shift 2 ;;
+    -h|--help)
+      cat <<HELP
+Usage: ./setup.sh [--force] [--only PHASE]
+
+Phases (in order): ${PHASES[*]}
+
+  --force        Redo every phase even if it looks already done.
+  --only PHASE   Only run the named phase.
+
+Env:
+  SPRITE_GH_TOKEN   one-shot PAT for gh auth (used once, never persisted).
+                    If unset, falls back to 'gh auth login --web' (device flow).
+HELP
+      exit 0 ;;
+    *) err "unknown flag: $1 (try --help)"; exit 2 ;;
+  esac
+done
+
+run_phase() {
+  local name="$1" fn="$2"
+  if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != "$name" ]]; then return 0; fi
+  local t0 t1
+  t0=$(date +%s)
+  log "Phase: $name"
+  if "$fn"; then
+    t1=$(date +%s)
+    ok "phase '$name' done ($((t1 - t0))s)"
+  else
+    local rc=$?
+    err "phase '$name' failed (rc=$rc)"
+    return $rc
+  fi
+}
+
+# ============================================================================
+# Preflight
+# ============================================================================
 if [[ $EUID -eq 0 ]]; then
   SUDO=""
 else
@@ -57,289 +103,373 @@ else
 fi
 SUDO="${SUDO-sudo}"
 
-# $USER and $HOME may be unset in containers, chroots, or 'su' sessions.
-# Set both defensively so 'set -u' doesn't trip on them later.
 : "${USER:=$(id -un)}"
 : "${HOME:=$(getent passwd "$USER" | cut -d: -f6)}"
-export USER HOME
+: "${HOSTNAME:=$(hostname)}"
+export USER HOME HOSTNAME
 
-# Keep sudo alive for the whole run (no-op when running as root).
-# Cleanup of SUDO_KEEPALIVE_PID is handled by the _finalize trap above.
 if [[ -n "$SUDO" ]]; then
   $SUDO -v
   ( while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
   SUDO_KEEPALIVE_PID=$!
 fi
 
-# --- 1. system update -------------------------------------------------------
-log "Updating apt and upgrading packages"
-$SUDO apt-get update -y
-$SUDO DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+# Make tools installed in previous phases (or previous runs) visible to this run.
+export PATH="$HOME/.local/bin:$HOME/.fly/bin:$PATH"
 
-# --- 2. core packages -------------------------------------------------------
-log "Installing core packages (only things sprite's base image doesn't ship)"
-# Verified preinstalled by sprite (do NOT add here): bash, zsh, fish, vim,
-# nano, tmux, git, curl, wget, jq, htop, tree, dig, make, pkg-config, rsync,
-# less, man, unzip, zip, tar, xz, iputils-ping, net-tools, build-essential,
-# ca-certificates, gnupg, plus all the language toolchains and gh CLI.
-# Python ships from /.sprite/languages/python/ so we skip python3-pip/venv too.
-$SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  apt-transport-https \
-  software-properties-common \
-  lsb-release \
-  shellcheck \
-  bat \
-  btop \
-  direnv \
-  fd-find \
-  fzf \
-  mosh \
-  ncdu \
-  neovim \
-  netcat-openbsd \
-  ripgrep \
-  traceroute \
-  yq
-ok "Core packages installed"
+# ============================================================================
+# Phases
+# ============================================================================
 
-# Ubuntu renames bat -> batcat, fd -> fdfind. Symlink to expected names.
-mkdir -p "$HOME/.local/bin"
-[[ -x /usr/bin/batcat && ! -e "$HOME/.local/bin/bat" ]] && ln -s /usr/bin/batcat "$HOME/.local/bin/bat"
-[[ -x /usr/bin/fdfind && ! -e "$HOME/.local/bin/fd"  ]] && ln -s /usr/bin/fdfind  "$HOME/.local/bin/fd"
+phase_apt_core() {
+  local needed=(
+    apt-transport-https software-properties-common lsb-release
+    shellcheck bat btop direnv fd-find fzf mosh ncdu neovim
+    netcat-openbsd ripgrep traceroute yq xclip
+  )
+  local missing=()
+  for pkg in "${needed[@]}"; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
 
-# --- 3. uv (Astral) ---------------------------------------------------------
-log "Installing uv"
-if ! command -v uv >/dev/null 2>&1; then
+  if [[ ${#missing[@]} -eq 0 && $FORCE -ne 1 ]]; then
+    skip "all core packages already present"
+  else
+    info "installing: ${missing[*]:-(force, full set)}"
+    $SUDO apt-get update -y
+    $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y "${needed[@]}"
+  fi
+
+  # Ubuntu renames bat -> batcat, fd -> fdfind. Provide the canonical names.
+  mkdir -p "$HOME/.local/bin"
+  [[ -x /usr/bin/batcat && ! -e "$HOME/.local/bin/bat" ]] && ln -s /usr/bin/batcat "$HOME/.local/bin/bat"
+  [[ -x /usr/bin/fdfind && ! -e "$HOME/.local/bin/fd"  ]] && ln -s /usr/bin/fdfind  "$HOME/.local/bin/fd"
+}
+
+phase_corepack() {
+  if ! command -v corepack >/dev/null 2>&1; then
+    warn "corepack not found (node missing?); skipping"
+    return 0
+  fi
+  if [[ $FORCE -ne 1 ]] && command -v pnpm >/dev/null 2>&1 && command -v yarn >/dev/null 2>&1; then
+    skip "pnpm and yarn already shimmed"
+    return 0
+  fi
+  corepack enable >/dev/null 2>&1 || warn "corepack enable failed (non-fatal)"
+}
+
+phase_uv() {
+  if [[ $FORCE -ne 1 ]] && command -v uv >/dev/null 2>&1; then
+    skip "uv $(uv --version 2>&1 | awk '{print $2}') already installed"
+    return 0
+  fi
   curl -LsSf https://astral.sh/uv/install.sh | sh
-fi
-export PATH="$HOME/.local/bin:$PATH"
-ok "uv: $("$HOME/.local/bin/uv" --version 2>/dev/null || uv --version || echo installed)"
+  export PATH="$HOME/.local/bin:$PATH"
+}
 
-# --- 4. bun: SKIPPED ---------------------------------------------------------
-# Sprite ships bun preinstalled at /.sprite/bin/bun. No install needed.
+phase_semgrep() {
+  if [[ $FORCE -ne 1 ]] && command -v semgrep >/dev/null 2>&1; then
+    skip "semgrep already installed"
+    return 0
+  fi
+  "$HOME/.local/bin/uv" tool install semgrep
+}
 
-# --- 5. semgrep via uv ------------------------------------------------------
-log "Installing semgrep via uv"
-"$HOME/.local/bin/uv" tool install semgrep
-ok "semgrep installed"
-
-# --- 6. trufflehog ----------------------------------------------------------
-log "Installing trufflehog"
-if ! command -v trufflehog >/dev/null 2>&1; then
+phase_trufflehog() {
+  if [[ $FORCE -ne 1 ]] && command -v trufflehog >/dev/null 2>&1; then
+    skip "trufflehog already installed"
+    return 0
+  fi
   curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
     | $SUDO sh -s -- -b /usr/local/bin
-fi
-ok "trufflehog: $(trufflehog --version 2>&1 | head -n1 || echo installed)"
+}
 
-# --- 7. Docker (official repo) ---------------------------------------------
-log "Installing Docker Engine (docker-ce + buildx + compose plugins)"
-for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
-  $SUDO apt-get remove -y "$pkg" >/dev/null 2>&1 || true
-done
+phase_docker() {
+  if [[ $FORCE -ne 1 ]] && command -v docker >/dev/null 2>&1 && [[ -f /etc/docker/daemon.json ]]; then
+    skip "docker present; daemon.json present"
+    return 0
+  fi
 
-$SUDO install -m 0755 -d /etc/apt/keyrings
-if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then
-  $SUDO curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  $SUDO chmod a+r /etc/apt/keyrings/docker.asc
-fi
+  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
+    $SUDO apt-get remove -y "$pkg" >/dev/null 2>&1 || true
+  done
 
-# Docker's apt repo can lag new Ubuntu codenames. Fall back to noble if missing.
-UBUNTU_CODENAME="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
-if ! curl -fsI "https://download.docker.com/linux/ubuntu/dists/${UBUNTU_CODENAME}/Release" >/dev/null 2>&1; then
-  warn "Docker repo has no release for '$UBUNTU_CODENAME' yet, falling back to 'noble'"
-  UBUNTU_CODENAME="noble"
-fi
+  $SUDO install -m 0755 -d /etc/apt/keyrings
+  if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then
+    $SUDO curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    $SUDO chmod a+r /etc/apt/keyrings/docker.asc
+  fi
 
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $UBUNTU_CODENAME stable" \
-  | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+  local codename
+  codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
+  if ! curl -fsI "https://download.docker.com/linux/ubuntu/dists/${codename}/Release" >/dev/null 2>&1; then
+    case "$codename" in
+      questing|oracular|plucky)
+        info "Docker has no '$codename' repo (expected for non-LTS); pinning to 'noble'" ;;
+      *)
+        warn "Docker repo has no release for '$codename'; falling back to 'noble'" ;;
+    esac
+    codename="noble"
+  fi
 
-$SUDO apt-get update -y
-$SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  docker-ce docker-ce-cli containerd.io \
-  docker-buildx-plugin docker-compose-plugin
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" \
+    | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
 
-$SUDO groupadd docker 2>/dev/null || true
-$SUDO usermod -aG docker "$USER"
-# systemctl may fail in containers/chroots; don't abort the whole run for it.
-if pidof systemd >/dev/null 2>&1; then
-  $SUDO systemctl enable --now docker     || warn "could not start docker via systemd"
-  $SUDO systemctl enable --now containerd || warn "could not start containerd via systemd"
-else
-  warn "systemd not running (container/chroot?); skipping enable --now for docker/containerd"
-fi
+  $SUDO apt-get update -y
+  $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin
 
-# Configurable daemon defaults (log rotation so /var/log doesn't fill up)
-if [[ ! -f /etc/docker/daemon.json ]]; then
-  $SUDO mkdir -p /etc/docker
-  $SUDO tee /etc/docker/daemon.json >/dev/null <<'JSON'
+  $SUDO groupadd docker 2>/dev/null || true
+  $SUDO usermod -aG docker "$USER"
+
+  if [[ ! -f /etc/docker/daemon.json ]]; then
+    $SUDO mkdir -p /etc/docker
+    $SUDO tee /etc/docker/daemon.json >/dev/null <<'JSON'
 {
   "log-driver": "json-file",
   "log-opts": { "max-size": "20m", "max-file": "5" },
   "live-restore": true
 }
 JSON
-  if pidof systemd >/dev/null 2>&1; then
-    $SUDO systemctl restart docker || warn "docker restart failed; apply daemon.json manually later"
   fi
-fi
-ok "Docker installed (re-login or run 'newgrp docker' to use without sudo)"
+}
 
-# --- 7b. sprite Service for dockerd ----------------------------------------
-# Sprite has no systemd. Without a Service, dockerd won't come back after a
-# wake-from-hibernate. Important wrinkle: sprite Services run as the sprite
-# user (uid 1001), but dockerd refuses to run non-root, so we register it
-# via 'sudo'. The sprite user has passwordless sudo on these boxes.
-if command -v sprite-env >/dev/null 2>&1; then
-  log "Registering dockerd as a sprite Service (via sudo)"
-  # If a previous run created a broken non-sudo dockerd service, drop it.
-  # Try a few likely subcommands; ignore failures (the cli surface may vary).
+phase_dockerd_service() {
+  if ! command -v sprite-env >/dev/null 2>&1; then
+    warn "sprite-env not on PATH; dockerd won't auto-start on wake"
+    return 0
+  fi
+  if [[ $FORCE -ne 1 ]] && sprite-env services list 2>/dev/null | grep -q '"dockerd"'; then
+    skip "dockerd sprite Service already registered"
+    return 0
+  fi
   if sprite-env services list 2>/dev/null | grep -q '"dockerd"'; then
-    warn "existing 'dockerd' service found; attempting to remove and recreate"
+    warn "removing existing 'dockerd' service before recreating"
     sprite-env services delete  dockerd 2>/dev/null \
       || sprite-env services remove  dockerd 2>/dev/null \
       || sprite-env services destroy dockerd 2>/dev/null \
-      || warn "couldn't auto-remove the old dockerd service; remove it by hand if dockerd doesn't come up"
+      || true
   fi
-  if sprite-env services create dockerd --cmd sudo --args "/usr/bin/dockerd" 2>&1; then
-    ok "sprite Service 'dockerd' created (sudo /usr/bin/dockerd; auto-starts on wake)"
-  else
-    warn "could not register dockerd as a sprite Service; start manually with 'sudo dockerd &'"
-  fi
-else
-  warn "sprite-env not on PATH; dockerd won't auto-start on wake. Start it manually with 'sudo dockerd &'."
-fi
 
-# --- 8. flyctl --------------------------------------------------------------
-log "Installing flyctl"
-if ! command -v flyctl >/dev/null 2>&1; then
-  # --non-interactive is documented in fly's install.sh: skips the
-  # "add to PATH?" prompt AND skips all rc edits. Our RC_BLOCK below adds
-  # ~/.fly/bin to BOTH .bashrc and .zshrc, so we don't need fly to do it.
+  info "registering dockerd Service (boot events stream for ~5s)"
+  # Filter the JSON event stream to lifecycle markers; full stream lands in
+  # /.sprite/logs/services/dockerd.log. PIPESTATUS keeps real failures visible.
+  set +o pipefail
+  sprite-env services create dockerd --cmd sudo --args "/usr/bin/dockerd" 2>&1 \
+    | grep --line-buffered -E '"type":"(started|complete|error)"' \
+    || true
+  local rc=${PIPESTATUS[0]}
+  set -o pipefail
+  if [[ $rc -ne 0 ]]; then
+    err "sprite-env services create exited with $rc"
+    return 1
+  fi
+}
+
+phase_flyctl() {
+  if [[ $FORCE -ne 1 ]] && command -v flyctl >/dev/null 2>&1; then
+    skip "flyctl already installed"
+    return 0
+  fi
   curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive
-fi
-# Make flyctl callable in the rest of this same script run.
-export PATH="$HOME/.fly/bin:$PATH"
-ok "flyctl installed"
+  export PATH="$HOME/.fly/bin:$PATH"
+}
 
-# --- 9. GitHub CLI: SKIPPED -------------------------------------------------
-# Sprite ships gh preinstalled at /.sprite/bin/gh. No install needed.
-
-# --- 10. SSH dir + GitHub known_hosts --------------------------------------
-log "Adding GitHub host keys to known_hosts"
-mkdir -p "$HOME/.ssh"
-chmod 700 "$HOME/.ssh"
-touch "$HOME/.ssh/known_hosts"
-chmod 644 "$HOME/.ssh/known_hosts"
-if ! ssh-keygen -F github.com -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1; then
+phase_ssh_known_hosts() {
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+  touch "$HOME/.ssh/known_hosts"
+  chmod 644 "$HOME/.ssh/known_hosts"
+  if [[ $FORCE -ne 1 ]] && ssh-keygen -F github.com -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1; then
+    skip "github.com already in known_hosts"
+    return 0
+  fi
   ssh-keyscan -t rsa,ecdsa,ed25519 github.com 2>/dev/null >> "$HOME/.ssh/known_hosts"
-  ok "github.com host keys added"
-else
-  ok "github.com already in known_hosts"
-fi
+}
 
-# --- 11. git identity -------------------------------------------------------
-log "Configuring git identity"
-current_name="$(git config --global user.name || true)"
-current_email="$(git config --global user.email || true)"
+phase_git_identity() {
+  local cur_name cur_email cur_branch
+  cur_name="$(git config --global user.name           || true)"
+  cur_email="$(git config --global user.email         || true)"
+  cur_branch="$(git config --global init.defaultBranch || true)"
 
-[[ -n "$current_name"  ]] && info "Existing user.name : $current_name"
-read -r -p "Git user.name [${current_name:-required}]: " git_name
-git_name="${git_name:-$current_name}"
-
-[[ -n "$current_email" ]] && info "Existing user.email: $current_email"
-read -r -p "Git user.email [${current_email:-required}]: " git_email
-git_email="${git_email:-$current_email}"
-
-if [[ -z "$git_name" || -z "$git_email" ]]; then
-  warn "Skipping git identity (name or email was empty)"
-else
-  git config --global user.name  "$git_name"
-  git config --global user.email "$git_email"
-  git config --global init.defaultBranch main
-  git config --global pull.rebase true
-  git config --global push.autoSetupRemote true
-  git config --global rerere.enabled true
-  git config --global color.ui auto
-  git config --global core.editor "vim"
-  git config --global fetch.prune true
-  # Handy git aliases (live in gitconfig, complement the shell aliases)
-  git config --global alias.lg     "log --oneline --graph --decorate --all"
-  git config --global alias.last   "log -1 HEAD"
-  git config --global alias.amend  "commit --amend --no-edit"
-  git config --global alias.unstage "reset HEAD --"
-  git config --global alias.cleanb "!git branch --merged | grep -vE '^\\*|^.\\s*(main|master|develop)$' | xargs -r git branch -d"
-  ok "git identity configured for $git_name <$git_email>"
-fi
-
-# --- 12. SSH key for GitHub -------------------------------------------------
-log "SSH key for GitHub"
-SSH_KEY="$HOME/.ssh/id_ed25519"
-if [[ -f "$SSH_KEY" ]]; then
-  ok "SSH key already exists at $SSH_KEY"
-else
-  read -r -p "Generate a new ed25519 SSH key for GitHub? [Y/n]: " gen_key
-  if [[ ! "$gen_key" =~ ^[Nn]$ ]]; then
-    ssh-keygen -t ed25519 -C "${git_email:-$USER@$(hostname)}" -f "$SSH_KEY" -N ""
-    eval "$(ssh-agent -s)" >/dev/null
-    ssh-add "$SSH_KEY" >/dev/null 2>&1 || true
-    ok "SSH key generated"
+  # Treat the sprite placeholder identity as unset.
+  if [[ "$cur_email" == "noreply@sprites.dev" ]]; then
+    info "found sprite placeholder identity; replacing"
+    cur_name=""; cur_email=""
   fi
-fi
-if [[ -f "${SSH_KEY}.pub" ]]; then
-  echo
-  echo "${BOLD}Add this public key to GitHub -> Settings -> SSH and GPG keys:${RESET}"
-  echo "${BOLD}https://github.com/settings/ssh/new${RESET}"
-  echo
-  cat "${SSH_KEY}.pub"
-  echo
-  read -r -p "Press Enter once you've added the key (or Ctrl-C to skip) " _
-  # Verify SSH works
-  if ssh -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
-    ok "GitHub SSH authentication works"
+
+  local need=0
+  [[ "$cur_name"   != "$GIT_USER_NAME"      ]] && need=1
+  [[ "$cur_email"  != "$GIT_USER_EMAIL"     ]] && need=1
+  [[ "$cur_branch" != "$GIT_DEFAULT_BRANCH" ]] && need=1
+
+  if [[ $need -eq 0 && $FORCE -ne 1 ]]; then
+    skip "identity already pinned to $GIT_USER_NAME <$GIT_USER_EMAIL>"
   else
-    warn "GitHub SSH auth not verified (you can retry with: ssh -T git@github.com)"
+    git config --global user.name          "$GIT_USER_NAME"
+    git config --global user.email         "$GIT_USER_EMAIL"
+    git config --global init.defaultBranch "$GIT_DEFAULT_BRANCH"
+    ok "identity set to $GIT_USER_NAME <$GIT_USER_EMAIL> (default branch $GIT_DEFAULT_BRANCH)"
   fi
-fi
 
-# --- 13. GH CLI token -------------------------------------------------------
-log "GitHub CLI token"
-warn "Plaintext tokens in rc files are convenient but not ideal."
-warn "Consider 'gh auth login' (keyring-backed) for a more secure alternative."
-read -r -s -p "Paste a GitHub PAT to export as GH_TOKEN (Enter to skip): " gh_token
-echo
-if [[ -n "$gh_token" ]]; then
-  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-    touch "$rc"
-    sed -i '/# >>> dev-env-setup GH_TOKEN >>>/,/# <<< dev-env-setup GH_TOKEN <<</d' "$rc"
-    {
-      echo ""
-      echo "# >>> dev-env-setup GH_TOKEN >>>"
-      echo "export GH_TOKEN='${gh_token}'"
-      echo 'export GITHUB_TOKEN="$GH_TOKEN"'
-      echo "# <<< dev-env-setup GH_TOKEN <<<"
-    } >> "$rc"
+  # These are always safe to (re-)apply.
+  git config --global pull.rebase          true
+  git config --global push.autoSetupRemote true
+  git config --global rerere.enabled       true
+  git config --global color.ui             auto
+  git config --global core.editor          vim
+  git config --global fetch.prune          true
+
+  git config --global alias.lg      "log --oneline --graph --decorate --all"
+  git config --global alias.last    "log -1 HEAD"
+  git config --global alias.amend   "commit --amend --no-edit"
+  git config --global alias.unstage "reset HEAD --"
+  git config --global alias.cleanb  "!git branch --merged | grep -vE '^\\*|^.\\s*(main|master|develop)$' | xargs -r git branch -d"
+}
+
+phase_ssh_key() {
+  local key="$HOME/.ssh/id_ed25519"
+  if [[ -f "$key" && $FORCE -ne 1 ]]; then
+    skip "SSH key already at $key (rotate with: --only ssh_key --force)"
+    return 0
+  fi
+  if [[ -f "$key" ]]; then
+    local ts; ts=$(date +%s)
+    info "rotating existing key (backup suffix: .bak.$ts)"
+    mv "$key"     "${key}.bak.${ts}"
+    [[ -f "${key}.pub" ]] && mv "${key}.pub" "${key}.pub.bak.${ts}"
+  fi
+  ssh-keygen -t ed25519 \
+    -C "${GIT_USER_EMAIL} (sprite:${HOSTNAME})" \
+    -f "$key" -N ""
+  eval "$(ssh-agent -s)" >/dev/null
+  ssh-add "$key" >/dev/null 2>&1 || true
+}
+
+phase_gh_auth() {
+  # Both scopes needed: admin:public_key for SSH auth keys (read + write),
+  # admin:ssh_signing_key for SSH commit-signing keys (read + write).
+  local needed_scopes="admin:public_key,admin:ssh_signing_key"
+
+  if [[ $FORCE -ne 1 ]] && gh auth status -h github.com >/dev/null 2>&1; then
+    local who; who="$(gh api user --jq .login 2>/dev/null || echo unknown)"
+    if [[ "$who" == "$GH_USERNAME" ]]; then
+      # Check existing token actually has the scopes we need.
+      local status_out; status_out="$(gh auth status -h github.com 2>&1)"
+      if echo "$status_out" | grep -q "admin:public_key" \
+         && echo "$status_out" | grep -q "admin:ssh_signing_key"; then
+        skip "gh already authenticated as $who with required scopes"
+        return 0
+      fi
+      info "gh authenticated as $who but missing SSH key scopes; refreshing"
+      gh auth refresh -h github.com -s "$needed_scopes"
+      ok "scopes refreshed"
+      return 0
+    fi
+    warn "gh authenticated as '$who' but expected '$GH_USERNAME'; re-authenticating"
+    gh auth logout -h github.com 2>/dev/null || true
+  fi
+
+  if [[ -n "${SPRITE_GH_TOKEN:-}" ]]; then
+    info "using SPRITE_GH_TOKEN from env (one-shot, not persisted)"
+    info "(PAT must include scopes: $needed_scopes)"
+    printf '%s' "$SPRITE_GH_TOKEN" | gh auth login \
+      --hostname github.com --git-protocol ssh --with-token
+    unset SPRITE_GH_TOKEN
+  else
+    info "starting device-code login (open the printed URL in any browser)"
+    info "requesting scopes: $needed_scopes"
+    gh auth login --hostname github.com --git-protocol ssh --web \
+      --scopes "$needed_scopes"
+  fi
+
+  local who; who="$(gh api user --jq .login 2>/dev/null || echo unknown)"
+  if [[ "$who" != "$GH_USERNAME" ]]; then
+    err "logged in as '$who' but expected '$GH_USERNAME' (aborting)"
+    return 1
+  fi
+  ok "gh authenticated as $who"
+}
+
+phase_gh_upload_keys() {
+  local pub="$HOME/.ssh/id_ed25519.pub"
+  [[ -f "$pub" ]] || { err "public key missing at $pub (run --only ssh_key first)"; return 1; }
+
+  local title_auth="sprite-${HOSTNAME}-auth"
+  local title_sign="sprite-${HOSTNAME}-signing"
+
+  # Use gh api directly so we get clean JSON instead of human-formatted output
+  # that may leak across stdout/stderr. Requires admin:public_key /
+  # admin:ssh_signing_key (granted by phase_gh_auth).
+  local existing_auth existing_sign
+  existing_auth="$(gh api user/keys --jq '.[].title' 2>/dev/null || true)"
+  existing_sign="$(gh api user/ssh_signing_keys --jq '.[].title' 2>/dev/null || true)"
+
+  if [[ $FORCE -ne 1 ]] && grep -qFx "$title_auth" <<<"$existing_auth"; then
+    skip "auth key '$title_auth' already on github"
+  else
+    gh ssh-key add "$pub" --title "$title_auth" --type authentication
+    ok "uploaded auth key '$title_auth'"
+  fi
+
+  if [[ $FORCE -ne 1 ]] && grep -qFx "$title_sign" <<<"$existing_sign"; then
+    skip "signing key '$title_sign' already on github"
+  else
+    gh ssh-key add "$pub" --title "$title_sign" --type signing
+    ok "uploaded signing key '$title_sign'"
+  fi
+
+  # GitHub needs a moment to propagate newly uploaded keys to the SSH layer.
+  # Retry a handful of times before giving up.
+  local tries=0 max=6
+  while (( tries < max )); do
+    if ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+           -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
+      ok "github SSH auth verified (attempt $((tries+1)))"
+      return 0
+    fi
+    tries=$((tries+1))
+    sleep 2
   done
-  chmod 600 "$HOME/.bashrc" "$HOME/.zshrc" 2>/dev/null || true
-  ok "GH_TOKEN added to .bashrc and .zshrc (mode 600)"
-else
-  warn "Skipped GH_TOKEN"
-fi
+  warn "github SSH auth not verified after $max attempts (retry: ssh -T git@github.com)"
+}
+phase_git_signing() {
+  local pub="$HOME/.ssh/id_ed25519.pub"
+  local signers="$HOME/.ssh/allowed_signers"
+  [[ -f "$pub" ]] || { err "pub key missing at $pub"; return 1; }
 
-# --- 14. Shell rc additions (PATH + aliases) -------------------------------
-log "Adding PATH and aliases to .bashrc and .zshrc"
-RC_BLOCK=$(cat <<'EOF'
+  git config --global gpg.format                ssh
+  git config --global user.signingkey           "$pub"
+  git config --global commit.gpgsign            true
+  git config --global tag.gpgsign               true
+  git config --global gpg.ssh.allowedSignersFile "$signers"
+
+  if [[ -f "$signers" ]] && grep -qF "$(cat "$pub")" "$signers" 2>/dev/null && [[ $FORCE -ne 1 ]]; then
+    skip "$signers already lists this key"
+  else
+    echo "${GIT_USER_EMAIL} namespaces=\"git\" $(cat "$pub")" >> "$signers"
+    chmod 644 "$signers"
+    ok "wrote $signers"
+  fi
+}
+
+phase_rc_additions() {
+  RC_BLOCK=$(cat <<'EOF'
 
 # >>> dev-env-setup shell additions >>>
-# ~/.local/bin holds sprite-installed CLIs (claude, codex, gemini, cursor-agent)
-# plus anything 'uv tool install' lands. The uv installer also adds this line
-# itself; the duplicate is harmless.
 export PATH="$HOME/.local/bin:$PATH"
-
-# flyctl: fly's installer only edits the rc matching $SHELL. Add it here so
-# both bash and zsh users see flyctl, regardless of which shell they invoke.
 [ -d "$HOME/.fly/bin" ] && export PATH="$HOME/.fly/bin:$PATH"
 
-# direnv hook (auto-detect current shell)
+# GH_TOKEN/GITHUB_TOKEN derived live from gh's secure store.
+# No plaintext token on disk; rotation in gh just works.
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  export GH_TOKEN="$(gh auth token 2>/dev/null)"
+  export GITHUB_TOKEN="$GH_TOKEN"
+fi
+
+# direnv (auto-detect current shell)
 if command -v direnv >/dev/null 2>&1; then
   case "$(basename "${SHELL:-bash}")" in
     bash) eval "$(direnv hook bash)" ;;
@@ -347,84 +477,82 @@ if command -v direnv >/dev/null 2>&1; then
   esac
 fi
 
-# fzf keybindings/completion (if present)
+# fzf keybindings (if present)
 [ -f /usr/share/doc/fzf/examples/key-bindings.bash ] && [ -n "$BASH_VERSION" ] && \
   source /usr/share/doc/fzf/examples/key-bindings.bash
 [ -f /usr/share/doc/fzf/examples/key-bindings.zsh ]  && [ -n "$ZSH_VERSION" ]  && \
   source /usr/share/doc/fzf/examples/key-bindings.zsh
 
 # Git aliases
-alias g='git'
-alias gs='git status'
-alias gst='git status'
-alias ga='git add'
-alias gaa='git add --all'
-alias gc='git commit'
-alias gcm='git commit -m'
-alias gca='git commit --amend'
-alias gcan='git commit --amend --no-edit'
-alias gco='git checkout'
-alias gcb='git checkout -b'
-alias gsw='git switch'
-alias gswc='git switch -c'
-alias gb='git branch'
-alias gba='git branch -a'
-alias gbd='git branch -d'
-alias gd='git diff'
-alias gds='git diff --staged'
+alias g='git'; alias gs='git status'; alias gst='git status'
+alias ga='git add'; alias gaa='git add --all'
+alias gc='git commit'; alias gcm='git commit -m'
+alias gca='git commit --amend'; alias gcan='git commit --amend --no-edit'
+alias gco='git checkout'; alias gcb='git checkout -b'
+alias gsw='git switch'; alias gswc='git switch -c'
+alias gb='git branch'; alias gba='git branch -a'; alias gbd='git branch -d'
+alias gd='git diff'; alias gds='git diff --staged'
 alias gl='git log --oneline --graph --decorate'
 alias gla='git log --oneline --graph --decorate --all'
-alias gp='git pull --rebase'
-alias gpu='git push'
-alias gpf='git push --force-with-lease'
+alias gp='git pull --rebase'; alias gpu='git push'; alias gpf='git push --force-with-lease'
 alias gf='git fetch --all --prune'
-alias grh='git reset HEAD'
-alias grhh='git reset --hard HEAD'
-alias gstash='git stash'
-alias gpop='git stash pop'
+alias grh='git reset HEAD'; alias grhh='git reset --hard HEAD'
+alias gstash='git stash'; alias gpop='git stash pop'
 alias gcp='git cherry-pick'
-alias gwip='git add -A && git commit -m "wip"'
-alias gunwip='git reset HEAD~1'
+alias gwip='git add -A && git commit -m "wip"'; alias gunwip='git reset HEAD~1'
 
 # Quality of life
-alias ll='ls -lah --color=auto'
-alias la='ls -A --color=auto'
-alias l='ls -CF --color=auto'
-alias ..='cd ..'
-alias ...='cd ../..'
-alias ....='cd ../../..'
-alias df='df -h'
-alias du='du -h'
-alias free='free -h'
-alias ports='ss -tulpn'
-alias myip='curl -s ifconfig.me'
+alias ll='ls -lah --color=auto'; alias la='ls -A --color=auto'; alias l='ls -CF --color=auto'
+alias ..='cd ..'; alias ...='cd ../..'; alias ....='cd ../../..'
+alias df='df -h'; alias du='du -h'; alias free='free -h'
+alias ports='ss -tulpn'; alias myip='curl -s ifconfig.me'
 alias reload='exec $SHELL -l'
 
 # Docker
-alias d='docker'
-alias dc='docker compose'
-alias dps='docker ps'
-alias dpsa='docker ps -a'
+alias d='docker'; alias dc='docker compose'
+alias dps='docker ps'; alias dpsa='docker ps -a'
 alias dim='docker images'
 alias dprune='docker system prune -af --volumes'
 
-# tmux: re-attach or start
+# tmux
 alias t='tmux attach || tmux new'
-# <<< dev-env-setup shell additions <<<
+# <<< dev-env-setup shell additions <
 EOF
 )
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    touch "$rc"
+    # Strip both the current block and the legacy GH_TOKEN block from older runs.
+    sed -i '/# >>> dev-env-setup shell additions >>>/,/# <<< dev-env-setup shell additions <<</d' "$rc"
+    sed -i '/# >>> dev-env-setup GH_TOKEN >>>/,/# <<< dev-env-setup GH_TOKEN <<</d' "$rc"
+    printf "%s\n" "$RC_BLOCK" >> "$rc"
+  done
+  chmod 644 "$HOME/.bashrc" "$HOME/.zshrc" 2>/dev/null || true
+}
 
-for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-  touch "$rc"
-  sed -i '/# >>> dev-env-setup shell additions >>>/,/# <<< dev-env-setup shell additions <<</d' "$rc"
-  printf "%s\n" "$RC_BLOCK" >> "$rc"
-done
-ok "PATH + aliases added"
+# ============================================================================
+# Run
+# ============================================================================
+START_TIME=$(date +%s)
 
-# --- done -------------------------------------------------------------------
-echo
-log "All done"
-info "1. Open a new shell or run: source ~/.bashrc  (or ~/.zshrc)"
+run_phase apt_core         phase_apt_core
+run_phase corepack         phase_corepack
+run_phase uv               phase_uv
+run_phase semgrep          phase_semgrep
+run_phase trufflehog       phase_trufflehog
+run_phase docker           phase_docker
+run_phase dockerd_service  phase_dockerd_service
+run_phase flyctl           phase_flyctl
+run_phase ssh_known_hosts  phase_ssh_known_hosts
+run_phase git_identity     phase_git_identity
+run_phase ssh_key          phase_ssh_key
+run_phase gh_auth          phase_gh_auth
+run_phase gh_upload_keys   phase_gh_upload_keys
+run_phase git_signing      phase_git_signing
+run_phase rc_additions     phase_rc_additions
+
+ELAPSED=$(( $(date +%s) - START_TIME ))
+log "All done (${ELAPSED}s)"
+info "1. Open a new shell or run: source ~/.bashrc (or ~/.zshrc)"
 info "2. For docker without sudo: log out/in, or run 'newgrp docker'"
-info "3. If you skipped the SSH key, add one later with: ssh-keygen -t ed25519"
+info "3. Verify with: ./post.sh"
 echo
