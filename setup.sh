@@ -691,14 +691,20 @@ print_summary
 echo
 log "All done (${ELAPSED}s)"
 
-# Tell the user about their actual shell, not "bash or zsh".
-case "$(basename "${SHELL:-bash}")" in
-  zsh)  RC_FILE="$HOME/.zshrc"  ;;
-  bash) RC_FILE="$HOME/.bashrc" ;;
-  fish) RC_FILE="$HOME/.config/fish/config.fish"
-        warn "fish detected; rc additions were written to .bashrc/.zshrc only" ;;
-  *)    RC_FILE="$HOME/.bashrc" ;;
-esac
+# Detect the script's interpreter for the next-steps message.
+if [ -n "${BASH_VERSION:-}" ]; then
+  RC_FILE="$HOME/.bashrc"
+elif [ -n "${ZSH_VERSION:-}" ]; then
+  RC_FILE="$HOME/.zshrc"
+else
+  case "$(basename "${SHELL:-bash}")" in
+    zsh)  RC_FILE="$HOME/.zshrc"  ;;
+    bash) RC_FILE="$HOME/.bashrc" ;;
+    fish) RC_FILE="$HOME/.config/fish/config.fish"
+          warn "fish detected; rc additions were written to .bashrc/.zshrc only" ;;
+    *)    RC_FILE="$HOME/.bashrc" ;;
+  esac
+fi
 info "1. Open a new shell or run: source $RC_FILE"
 info "2. For docker without sudo: log out/in, or run 'newgrp docker'"
 info "3. Per-phase logs (if you want to inspect): $PHASE_LOG_DIR/"
