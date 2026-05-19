@@ -10,6 +10,14 @@
 # Idempotent: safe to re-run. Each phase self-checks before doing work.
 #   --force         redo every phase even if it looks already done
 #   --only PHASE    run a single phase (see --help for the list)
+#   --status        dump phase state from $STATE_FILE and exit
+#
+# NOTE on set -e: phases are invoked via `if "$fn"; then` (see run_phase),
+# which puts the function in a conditional context. bash suppresses errexit
+# for everything inside a function called that way, so individual quiet()
+# failures do NOT abort the phase on their own. Critical commands must
+# therefore use explicit `|| return 1` to propagate failure. This is why
+# every `quiet ...` call below is followed by `|| return 1`.
 #
 set -euo pipefail
 
@@ -61,7 +69,8 @@ mkdir -p "$PHASE_LOG_DIR"
 # quiet <label> <command> [args...]
 # Run a command with stdout+stderr redirected to a per-label log file.
 # Silent on success; on failure prints the last 40 lines and returns
-# the command's exit code.
+# the command's exit code. Callers should chain `|| return 1` after this
+# because set -e is suppressed inside phases (see file-level note above).
 quiet() {
   local label="$1"; shift
   local log="$PHASE_LOG_DIR/${label}.log"
@@ -72,8 +81,85 @@ quiet() {
   fi
   err "$label failed (rc=$rc); last 40 lines below (full log: $log):"
   tail -n 40 "$log" 2>/dev/null | sed 's/^/    /' >&2 || true
-  return $rc
+  return "$rc"
 }
+
+# ============================================================================
+# State file (~/.config/sprite-setup/state.json)
+# ============================================================================
+STATE_DIR="$HOME/.config/sprite-setup"
+STATE_FILE="$STATE_DIR/state.json"
+
+# state_init — make sure $STATE_FILE exists and is well-formed JSON.
+state_init() {
+  mkdir -p "$STATE_DIR"
+  if [[ ! -s "$STATE_FILE" ]] || ! jq -e . "$STATE_FILE" >/dev/null 2>&1; then
+    printf '{"schema_version":1,"last_updated":null,"phases":{}}\n' > "$STATE_FILE"
+  fi
+}
+
+# state_write_phase NAME RC DID_WORK DURATION_S
+# Records the most recent run of a phase. Safe to call from anywhere
+# after state_init has been invoked at least once this run.
+state_write_phase() {
+  local name="$1" rc="$2" did_work="$3" duration="$4"
+  local now success bool_did_work
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$rc" -eq 0 ]]; then success="true"; else success="false"; fi
+  if [[ "$did_work" -eq 1 ]]; then bool_did_work="true"; else bool_did_work="false"; fi
+  local tmp
+  tmp="$(mktemp)"
+  jq --arg name "$name" \
+     --arg ts   "$now" \
+     --argjson success  "$success" \
+     --argjson did_work "$bool_did_work" \
+     --argjson duration "$duration" \
+     '.last_updated = $ts
+      | .phases[$name] = {
+          "last_run":   $ts,
+          "did_work":   $did_work,
+          "success":    $success,
+          "duration_s": $duration,
+          "rc":         '"$rc"'
+        }' \
+     "$STATE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$STATE_FILE" || rm -f "$tmp"
+}
+
+# state_dump — render the state file as a table and exit. Driven by --status.
+state_dump() {
+  if [[ ! -s "$STATE_FILE" ]]; then
+    echo "no state file at $STATE_FILE (setup.sh hasn't been run yet)"
+    return 0
+  fi
+  echo "state file: $STATE_FILE"
+  echo "last updated: $(jq -r '.last_updated // "(never)"' "$STATE_FILE")"
+  echo
+  printf "%-22s  %-22s  %-7s  %-9s  %-10s\n" "PHASE" "LAST RUN" "RESULT" "DID WORK" "DURATION"
+  printf "%-22s  %-22s  %-7s  %-9s  %-10s\n" "----------------------" "----------------------" "-------" "---------" "----------"
+  jq -r '
+    .phases
+    | to_entries
+    | sort_by(.key)
+    | .[]
+    | [
+        .key,
+        (.value.last_run // "-"),
+        (if .value.success then "ok" else "fail" end),
+        (if .value.did_work then "yes" else "no" end),
+        (((.value.duration_s // 0) | tostring) + "s")
+      ]
+    | @tsv
+  ' "$STATE_FILE" \
+    | awk -F '\t' '{ printf "%-22s  %-22s  %-7s  %-9s  %-10s\n", $1, $2, $3, $4, $5 }'
+}
+
+# ============================================================================
+# Phase-result tracking (drives the end-of-run summary)
+# ============================================================================
+PHASES_RAN=()        # did real work this run
+PHASES_SKIPPED=()    # all idempotency checks passed
+PHASES_FAILED=()     # something blew up
+PHASE_DID_WORK=0     # toggled to 1 by ok() inside a phase
 
 print_summary() {
   log "Summary"
@@ -98,40 +184,39 @@ print_summary() {
 }
 
 # ============================================================================
-# Phase-result tracking (drives the end-of-run summary)
-# ============================================================================
-PHASES_RAN=()        # did real work this run
-PHASES_SKIPPED=()    # all idempotency checks passed
-PHASES_FAILED=()     # something blew up
-PHASE_DID_WORK=0     # toggled to 1 by ok() inside a phase
-
-# ============================================================================
 # CLI flags
 # ============================================================================
 FORCE=0
 ONLY_PHASE=""
+DO_STATUS=0
 PHASES=(
-  apt_core corepack uv semgrep garlic cosign trufflehog
+  apt_core
+  corepack node_lts go_toolchain rust_toolchain
+  uv black garlic pre_commit ruff semgrep
+  cosign trufflehog dive gitleaks hadolint
   docker dockerd_service flyctl
   claude_upgrade claude_settings
+  pre_commit_template gitignore_global
   ssh_known_hosts git_identity ssh_key
   gh_auth gh_upload_keys git_signing
-  clone_repos
-  rc_additions
+  clone_repos garlic_defaults
+  ps1 zsh_completions rc_additions
   verify
 )
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --force) FORCE=1; shift ;;
-    --only)  ONLY_PHASE="${2:-}"; shift 2 ;;
+    --force)  FORCE=1; shift ;;
+    --only)   ONLY_PHASE="${2:-}"; shift 2 ;;
+    --status) DO_STATUS=1; shift ;;
     -h|--help)
       cat <<HELP
-Usage: ./setup.sh [--force] [--only PHASE]
+Usage: ./setup.sh [--force] [--only PHASE] [--status]
 
 Phases (in order): ${PHASES[*]}
 
   --force        Redo every phase even if it looks already done.
   --only PHASE   Only run the named phase.
+  --status       Dump phase state from $STATE_FILE and exit.
 
 Env:
   SPRITE_GH_TOKEN   one-shot PAT for gh auth (used once, never persisted).
@@ -142,30 +227,66 @@ HELP
   esac
 done
 
+# Handle --status before any other work.
+if [[ $DO_STATUS -eq 1 ]]; then
+  state_dump
+  exit 0
+fi
+
 # `run_phase` reads PHASE_DID_WORK after the function returns to decide
-# which bucket to put the phase in.
+# which bucket to put the phase in. NOTE: invoking via `if "$fn"; then`
+# suppresses set -e inside the phase; phases must use explicit `|| return 1`
+# on critical commands. See file-level note above quiet().
 run_phase() {
   local name="$1" fn="$2"
   if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != "$name" ]]; then return 0; fi
-  local t0 t1 elapsed
+  local t0 t1 elapsed rc=0
   t0=$(date +%s)
   PHASE_DID_WORK=0
   log "Phase: $name"
   if "$fn"; then
-    t1=$(date +%s); elapsed=$((t1 - t0))
+    rc=0
+  else
+    rc=$?
+  fi
+  t1=$(date +%s); elapsed=$((t1 - t0))
+  state_write_phase "$name" "$rc" "$PHASE_DID_WORK" "$elapsed"
+  if [[ $rc -eq 0 ]]; then
     if [[ $PHASE_DID_WORK -eq 1 ]]; then
       PHASES_RAN+=("$name (${elapsed}s)")
     else
       PHASES_SKIPPED+=("$name")
     fi
-    # raw printf so this trailing OK doesn't also toggle PHASE_DID_WORK
     printf "%s+%s phase '%s' done (%ss)\n" "$GREEN" "$RESET" "$name" "$elapsed"
   else
-    local rc=$?
     PHASES_FAILED+=("$name (rc=$rc)")
     err "phase '$name' failed (rc=$rc)"
-    return $rc
+    return "$rc"
   fi
+}
+
+# `bracket_phase` is like run_phase but doesn't update the regular tracking
+# arrays and never aborts the script on failure. Used for the pre/post
+# checkpoint phases that run outside the main PHASES loop.
+bracket_phase() {
+  local name="$1" fn="$2"
+  local t0 t1 elapsed rc=0
+  t0=$(date +%s)
+  PHASE_DID_WORK=0
+  log "Phase: $name (bracket)"
+  if "$fn"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  t1=$(date +%s); elapsed=$((t1 - t0))
+  state_write_phase "$name" "$rc" "$PHASE_DID_WORK" "$elapsed"
+  if [[ $rc -eq 0 ]]; then
+    printf "%s+%s bracket '%s' done (%ss)\n" "$GREEN" "$RESET" "$name" "$elapsed"
+  else
+    warn "bracket '$name' returned rc=$rc; continuing"
+  fi
+  return 0
 }
 
 # ============================================================================
@@ -190,21 +311,81 @@ if [[ -n "$SUDO" ]]; then
 fi
 
 # Make tools installed in previous phases (or previous runs) visible to this run.
-export PATH="$HOME/.local/bin:$HOME/.fly/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.fly/bin:/usr/local/bin:$PATH"
+
+state_init
+
+# ============================================================================
+# Helpers shared by binary-install phases
+# ============================================================================
+
+# arch_dpkg — print amd64/arm64 or fail.
+arch_dpkg() {
+  case "$(dpkg --print-architecture)" in
+    amd64) echo amd64 ;;
+    arm64) echo arm64 ;;
+    *)     return 1 ;;
+  esac
+}
+
+# gh_latest_tag REPO — print the latest release tag for owner/repo via the
+# GitHub API, stripping any leading "v". Returns 1 if the API call fails
+# or the tag can't be parsed.
+gh_latest_tag() {
+  local repo="$1" api_json tag
+  api_json="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null)" || return 1
+  tag="$(printf '%s\n' "$api_json" | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')"
+  [[ -n "$tag" ]] || return 1
+  printf '%s\n' "$tag"
+}
+
+# ============================================================================
+# Bracket phases (NOT in the main PHASES array)
+# ============================================================================
+
+phase_pre_checkpoint() {
+  if ! command -v sprite-env >/dev/null 2>&1; then
+    skip "sprite-env not on PATH; skipping pre-setup checkpoint"
+    return 0
+  fi
+  local label="pre-setup-$(date +%s)"
+  info "creating sprite checkpoint '$label'..."
+  if quiet pre-checkpoint sprite-env checkpoint create --name "$label"; then
+    ok "pre-setup checkpoint '$label' created"
+  else
+    warn "pre-setup checkpoint failed (continuing anyway)"
+  fi
+  return 0
+}
+
+phase_post_checkpoint() {
+  if ! command -v sprite-env >/dev/null 2>&1; then
+    skip "sprite-env not on PATH; skipping post-setup checkpoint"
+    return 0
+  fi
+  local label="post-setup-$(date +%s)"
+  info "creating sprite checkpoint '$label'..."
+  if quiet post-checkpoint sprite-env checkpoint create --name "$label"; then
+    ok "post-setup checkpoint '$label' created"
+  else
+    warn "post-setup checkpoint failed (continuing anyway)"
+  fi
+  return 0
+}
 
 # ============================================================================
 # Phases
 # ============================================================================
 
 phase_apt_core() {
-  # Wave A additions: tmux, tldr, hyperfine, zoxide.
-  # gitleaks is intentionally NOT here; it's not packaged in Ubuntu's archive,
-  # ships as a Go binary from GitHub releases. It will land in Wave B as a
-  # binary-install phase modelled on phase_cosign.
+  # NOTE: tealdeer (Rust impl of tldr) provides the `tldr` command and IS in
+  # Ubuntu's archive; the older `tldr` package (Node client) is not available
+  # on questing, which is what broke Wave A. tealdeer ships the `tldr` binary
+  # natively so no symlink is needed.
   local needed=(
     apt-transport-https software-properties-common lsb-release
     shellcheck bat btop direnv fd-find fzf hyperfine jq mosh ncdu neovim
-    netcat-openbsd ripgrep tldr tmux traceroute yq zoxide xclip
+    netcat-openbsd ripgrep tealdeer tmux traceroute yq zoxide xclip
   )
   local missing=()
   for pkg in "${needed[@]}"; do
@@ -215,9 +396,9 @@ phase_apt_core() {
     skip "all core packages already present"
   else
     info "installing ${#missing[@]} apt package(s)..."
-    quiet apt-update  $SUDO apt-get update -y
+    quiet apt-update  $SUDO apt-get update -y || return 1
     quiet apt-install $SUDO DEBIAN_FRONTEND=noninteractive \
-                         apt-get install -y "${needed[@]}"
+                         apt-get install -y "${needed[@]}" || return 1
     ok "installed ${#missing[@]} package(s)"
   fi
 
@@ -252,74 +433,157 @@ phase_corepack() {
   return 0
 }
 
+# phase_node_lts — ensure node is on the current LTS major via nvm.
+# The sprite ships node 22.x (LTS at time of writing); if that's already
+# the case we skip. Otherwise we source nvm and install --lts.
+phase_node_lts() {
+  local nvm_sh="/.sprite/languages/node/nvm/nvm.sh"
+  if [[ ! -f "$nvm_sh" ]]; then
+    warn "nvm not found at $nvm_sh; skipping (sprite base image may have drifted)"
+    return 0
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    warn "node not on PATH; skipping (sprite base image issue)"
+    return 0
+  fi
+
+  # Current LTS major. Hard-coded conservatively; bump when LTS rolls over.
+  local lts_major=22
+  local cur_major
+  cur_major="$(node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1)"
+
+  if [[ "$cur_major" == "$lts_major" && $FORCE -ne 1 ]]; then
+    skip "node already on LTS major (v${cur_major}.x); nothing to do"
+    return 0
+  fi
+
+  info "installing node --lts via nvm (current major: ${cur_major:-unknown}, target: $lts_major)..."
+  # nvm.sh expects bash; source in a subshell-style block to avoid leaking vars.
+  # shellcheck disable=SC1090
+  if quiet node-lts bash -c "set -e; source '$nvm_sh'; nvm install --lts && nvm alias default 'lts/*'"; then
+    ok "node LTS installed/updated"
+  else
+    return 1
+  fi
+  return 0
+}
+
+# phase_go_toolchain — trust the sprite-provided go.
+# Rationale: the sprite ships a recent stable go under /.sprite/bin/go, and
+# the sprite docs explicitly say not to reinstall pre-installed toolchains.
+# This phase exists for symmetry/visibility in --status output and does NOT
+# touch the go install. If you need a different go version, use sprite-env
+# to manage it, not this script.
+phase_go_toolchain() {
+  if ! command -v go >/dev/null 2>&1; then
+    warn "go not on PATH; expected sprite-provided go under /.sprite/bin/"
+    return 0
+  fi
+  local v
+  v="$(go version 2>/dev/null | awk '{print $3}' || echo unknown)"
+  note "using sprite-provided go ($v); skipping reinstall by design"
+  return 0
+}
+
+# phase_rust_toolchain — pin stable + common components.
+# Idempotent: parses `rustup show active-toolchain` and checks installed
+# components before doing anything.
+phase_rust_toolchain() {
+  if ! command -v rustup >/dev/null 2>&1; then
+    warn "rustup not on PATH; expected sprite-provided rustup under /.sprite/bin/"
+    return 0
+  fi
+
+  local active
+  active="$(rustup show active-toolchain 2>/dev/null | awk '{print $1}' || echo "")"
+  local need_stable=1
+  if [[ "$active" == stable-* ]]; then need_stable=0; fi
+
+  local installed_components
+  installed_components="$(rustup component list --installed 2>/dev/null || echo "")"
+  local want_components=(clippy rustfmt rust-analyzer)
+  local missing_components=()
+  local c
+  for c in "${want_components[@]}"; do
+    grep -q "^$c-" <<<"$installed_components" || missing_components+=("$c")
+  done
+
+  if [[ $need_stable -eq 0 && ${#missing_components[@]} -eq 0 && $FORCE -ne 1 ]]; then
+    skip "rust stable active ($active); all components present"
+    return 0
+  fi
+
+  if [[ $need_stable -eq 1 ]]; then
+    info "setting rust default to stable..."
+    quiet rust-default rustup default stable || return 1
+  fi
+  if [[ ${#missing_components[@]} -gt 0 ]]; then
+    info "installing missing components: ${missing_components[*]}"
+    quiet rust-components rustup component add "${missing_components[@]}" || return 1
+  fi
+  ok "rust stable pinned with clippy/rustfmt/rust-analyzer"
+  return 0
+}
+
 phase_uv() {
   if [[ $FORCE -ne 1 ]] && command -v uv >/dev/null 2>&1; then
     skip "uv $(uv --version 2>&1 | awk '{print $2}') already installed"
     return 0
   fi
   info "installing uv (Astral)..."
-  quiet uv-install bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+  quiet uv-install bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh' || return 1
   export PATH="$HOME/.local/bin:$PATH"
   ok "uv installed"
   return 0
 }
 
-phase_semgrep() {
-  if [[ $FORCE -ne 1 ]] && command -v semgrep >/dev/null 2>&1; then
-    skip "semgrep already installed"
+# Generic "install a Python tool via `uv tool install`" wrapper.
+# Used by phase_black, phase_pre_commit, phase_ruff, phase_semgrep, phase_garlic.
+# Each phase passes its own (tool, install_name, label) tuple.
+_uv_tool_install() {
+  local tool="$1" install_name="$2" label="$3"
+  if [[ $FORCE -ne 1 ]] && command -v "$tool" >/dev/null 2>&1; then
+    skip "$tool already installed"
     return 0
   fi
-  info "installing semgrep via uv..."
-  quiet semgrep "$HOME/.local/bin/uv" tool install semgrep
-  ok "semgrep installed"
+  if [[ ! -x "$HOME/.local/bin/uv" ]]; then
+    err "uv not installed; run --only uv first (or unrestricted)"
+    return 1
+  fi
+  info "installing $tool via uv (package: $install_name)..."
+  quiet "$label" "$HOME/.local/bin/uv" tool install "$install_name" || return 1
+  ok "$tool installed"
   return 0
 }
 
-phase_garlic() {
-  if [[ $FORCE -ne 1 ]] && command -v garlic >/dev/null 2>&1; then
-    skip "garlic already installed ($(garlic --version 2>&1 | head -1))"
-    return 0
-  fi
-  info "installing garlic-cli via uv tool install..."
-  quiet garlic "$HOME/.local/bin/uv" tool install garlic-cli
-  ok "garlic-cli installed"
-  return 0
-}
+phase_semgrep()    { _uv_tool_install semgrep     semgrep     semgrep; }
+phase_garlic()     { _uv_tool_install garlic      garlic-cli  garlic;  }
+phase_black()      { _uv_tool_install black       black       black;   }
+phase_pre_commit() { _uv_tool_install pre-commit  pre-commit  pre-commit; }
+phase_ruff()       { _uv_tool_install ruff        ruff        ruff;    }
 
+# phase_cosign — binary release via .deb from sigstore/cosign.
 phase_cosign() {
   if [[ $FORCE -ne 1 ]] && command -v cosign >/dev/null 2>&1; then
-    skip "cosign already installed ($(cosign version --short 2>&1 | head -1))"
+    skip "cosign already installed ($(cosign version 2>&1 | head -1))"
     return 0
   fi
 
   info "resolving latest cosign release tag..."
-  local api_json latest_version
-  if ! api_json="$(curl -fsSL https://api.github.com/repos/sigstore/cosign/releases/latest 2>/dev/null)"; then
-    err "could not fetch cosign release info from GitHub API"
-    return 1
-  fi
-  latest_version="$(printf '%s\n' "$api_json" | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')"
-  if [[ -z "$latest_version" ]]; then
-    err "could not parse cosign tag_name from GitHub API"
-    return 1
-  fi
-
-  local arch
-  case "$(dpkg --print-architecture)" in
-    amd64) arch=amd64 ;;
-    arm64) arch=arm64 ;;
-    *)     err "unsupported arch: $(dpkg --print-architecture)"; return 1 ;;
-  esac
+  local latest_version arch
+  latest_version="$(gh_latest_tag sigstore/cosign)" || { err "could not resolve cosign latest tag"; return 1; }
+  arch="$(arch_dpkg)" || { err "unsupported arch: $(dpkg --print-architecture)"; return 1; }
 
   local tmpdir deb url
   tmpdir="$(mktemp -d)"
+  # shellcheck disable=SC2064
   trap "rm -rf '$tmpdir'" RETURN
   deb="cosign_${latest_version}_${arch}.deb"
   url="https://github.com/sigstore/cosign/releases/download/v${latest_version}/${deb}"
 
   info "installing cosign ${latest_version} (${arch})..."
-  quiet cosign-download curl -fsSL -o "$tmpdir/$deb" "$url"
-  quiet cosign-install  $SUDO dpkg -i "$tmpdir/$deb"
+  quiet cosign-download curl -fsSL -o "$tmpdir/$deb" "$url" || return 1
+  quiet cosign-install  $SUDO dpkg -i "$tmpdir/$deb" || return 1
   ok "cosign ${latest_version} installed"
   return 0
 }
@@ -337,8 +601,97 @@ phase_trufflehog() {
   info "installing trufflehog (with cosign signature verification)..."
   quiet trufflehog bash -c \
     'curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-       | '"$SUDO"' sh -s -- -v -b /usr/local/bin'
+       | '"$SUDO"' sh -s -- -v -b /usr/local/bin' || return 1
   ok "trufflehog installed"
+  return 0
+}
+
+# phase_dive — .deb release from wagoodman/dive.
+phase_dive() {
+  if [[ $FORCE -ne 1 ]] && command -v dive >/dev/null 2>&1; then
+    skip "dive already installed ($(dive --version 2>&1 | head -1))"
+    return 0
+  fi
+
+  info "resolving latest dive release tag..."
+  local latest arch
+  latest="$(gh_latest_tag wagoodman/dive)" || { err "could not resolve dive latest tag"; return 1; }
+  arch="$(arch_dpkg)" || { err "unsupported arch: $(dpkg --print-architecture)"; return 1; }
+
+  local tmpdir deb url
+  tmpdir="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
+  deb="dive_${latest}_linux_${arch}.deb"
+  url="https://github.com/wagoodman/dive/releases/download/v${latest}/${deb}"
+
+  info "installing dive ${latest} (${arch})..."
+  quiet dive-download curl -fsSL -o "$tmpdir/$deb" "$url" || return 1
+  quiet dive-install  $SUDO dpkg -i "$tmpdir/$deb" || return 1
+  ok "dive ${latest} installed"
+  return 0
+}
+
+# phase_gitleaks — tarball release from gitleaks/gitleaks.
+phase_gitleaks() {
+  if [[ $FORCE -ne 1 ]] && command -v gitleaks >/dev/null 2>&1; then
+    skip "gitleaks already installed ($(gitleaks version 2>&1 | head -1))"
+    return 0
+  fi
+
+  info "resolving latest gitleaks release tag..."
+  local latest arch
+  latest="$(gh_latest_tag gitleaks/gitleaks)" || { err "could not resolve gitleaks latest tag"; return 1; }
+  arch="$(arch_dpkg)" || { err "unsupported arch: $(dpkg --print-architecture)"; return 1; }
+  # gitleaks tarballs are named with x64/arm64 (not amd64).
+  local gl_arch
+  case "$arch" in
+    amd64) gl_arch=x64 ;;
+    arm64) gl_arch=arm64 ;;
+  esac
+
+  local tmpdir tarball url
+  tmpdir="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
+  tarball="gitleaks_${latest}_linux_${gl_arch}.tar.gz"
+  url="https://github.com/gitleaks/gitleaks/releases/download/v${latest}/${tarball}"
+
+  info "installing gitleaks ${latest} (${gl_arch})..."
+  quiet gitleaks-download curl -fsSL -o "$tmpdir/$tarball" "$url" || return 1
+  quiet gitleaks-extract  tar -xzf "$tmpdir/$tarball" -C "$tmpdir" gitleaks || return 1
+  quiet gitleaks-install  $SUDO install -m 0755 "$tmpdir/gitleaks" /usr/local/bin/gitleaks || return 1
+  ok "gitleaks ${latest} installed"
+  return 0
+}
+
+# phase_hadolint — static binary from hadolint/hadolint.
+phase_hadolint() {
+  if [[ $FORCE -ne 1 ]] && command -v hadolint >/dev/null 2>&1; then
+    skip "hadolint already installed ($(hadolint --version 2>&1 | head -1))"
+    return 0
+  fi
+
+  info "resolving latest hadolint release tag..."
+  local latest dpkg_arch hadolint_arch
+  latest="$(gh_latest_tag hadolint/hadolint)" || { err "could not resolve hadolint latest tag"; return 1; }
+  dpkg_arch="$(arch_dpkg)" || { err "unsupported arch: $(dpkg --print-architecture)"; return 1; }
+  case "$dpkg_arch" in
+    amd64) hadolint_arch="x86_64" ;;
+    arm64) hadolint_arch="arm64" ;;
+  esac
+
+  local tmpdir bin url
+  tmpdir="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
+  bin="hadolint-Linux-${hadolint_arch}"
+  url="https://github.com/hadolint/hadolint/releases/download/v${latest}/${bin}"
+
+  info "installing hadolint ${latest} (${hadolint_arch})..."
+  quiet hadolint-download curl -fsSL -o "$tmpdir/hadolint" "$url" || return 1
+  quiet hadolint-install  $SUDO install -m 0755 "$tmpdir/hadolint" /usr/local/bin/hadolint || return 1
+  ok "hadolint ${latest} installed"
   return 0
 }
 
@@ -429,7 +782,7 @@ phase_flyctl() {
     return 0
   fi
   info "installing flyctl..."
-  quiet flyctl bash -c 'curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive'
+  quiet flyctl bash -c 'curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive' || return 1
   export PATH="$HOME/.fly/bin:$PATH"
   ok "flyctl installed"
   return 0
@@ -472,6 +825,149 @@ phase_claude_settings() {
   mv "$tmp" "$settings_file"
   chmod 644 "$settings_file"
   ok "set tui=fullscreen in $settings_file"
+  return 0
+}
+
+# phase_pre_commit_template — writes a starter .pre-commit-config.yaml that
+# users can copy into a new repo. Stored under ~/.config/pre-commit/ so it
+# doesn't conflict with any repo's actual config.
+phase_pre_commit_template() {
+  local dest_dir="$HOME/.config/pre-commit"
+  local dest="$dest_dir/.pre-commit-config.template.yaml"
+  mkdir -p "$dest_dir"
+
+  if [[ -f "$dest" && $FORCE -ne 1 ]]; then
+    skip "$dest already present"
+    return 0
+  fi
+
+  cat > "$dest" <<'YAML'
+# Starter pre-commit config installed by sprite-setup.
+# Copy to your repo as .pre-commit-config.yaml, then run `pre-commit install`.
+default_language_version:
+  python: python3
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-merge-conflict
+      - id: detect-private-key
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 24.10.0
+    hooks:
+      - id: black
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.10.0
+    hooks:
+      - id: shellcheck
+  - repo: https://github.com/semgrep/semgrep
+    rev: v1.96.0
+    hooks:
+      - id: semgrep
+        args: [--config=auto, --error, --skip-unknown-extensions]
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+  - repo: local
+    hooks:
+      - id: trufflehog
+        name: trufflehog
+        entry: trufflehog --no-update --fail filesystem .
+        language: system
+        pass_filenames: false
+YAML
+  chmod 644 "$dest"
+  ok "wrote pre-commit template to $dest"
+  return 0
+}
+
+# phase_gitignore_global — sensible default ~/.gitignore_global and wires
+# core.excludesFile to it.
+phase_gitignore_global() {
+  local dest="$HOME/.gitignore_global"
+
+  local desired
+  desired=$(cat <<'GIT'
+# Global ignore patterns. Managed by sprite-setup.
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+# Editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.fleet/
+.zed/
+# Direnv / envrc
+.envrc.local
+.direnv/
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# Node
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.next/
+# Rust
+target/
+# Go
+*.test
+*.out
+# Misc tooling
+.cache/
+.coverage
+.DS_Store?
+GIT
+)
+
+  local need_write=1
+  if [[ -f "$dest" ]]; then
+    local current
+    current="$(cat "$dest")"
+    if [[ "$current" == "$desired" && $FORCE -ne 1 ]]; then
+      need_write=0
+    fi
+  fi
+  if [[ $need_write -eq 1 ]]; then
+    printf "%s\n" "$desired" > "$dest"
+    chmod 644 "$dest"
+    ok "wrote $dest"
+  else
+    skip "$dest already current"
+  fi
+
+  local cur_exc
+  cur_exc="$(git config --global core.excludesFile 2>/dev/null || echo "")"
+  if [[ "$cur_exc" != "$dest" ]]; then
+    git config --global core.excludesFile "$dest"
+    ok "git core.excludesFile = $dest"
+  else
+    skip "git core.excludesFile already $dest"
+  fi
   return 0
 }
 
@@ -625,7 +1121,7 @@ phase_gh_upload_keys() {
   fi
 
   # GitHub can take >30s to propagate freshly uploaded keys. Retry with backoff.
-  local last_output="" total=0 wait=3
+  local last_output="" total=0 wait=3 attempt
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     last_output="$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
                        -T git@github.com 2>&1)"
@@ -702,6 +1198,136 @@ phase_clone_repos() {
   return 0
 }
 
+# phase_garlic_defaults — run `garlic --defaults` to populate garlic-managed
+# config. We can't know exactly which files garlic writes, so we use a
+# sentinel file under our own state dir and skip if it exists (unless --force).
+phase_garlic_defaults() {
+  if ! command -v garlic >/dev/null 2>&1; then
+    warn "garlic not on PATH; run --only garlic first"
+    return 0
+  fi
+  local sentinel="$STATE_DIR/garlic-defaults.applied"
+  if [[ -f "$sentinel" && $FORCE -ne 1 ]]; then
+    skip "garlic defaults already applied (sentinel: $sentinel; --force to reapply)"
+    return 0
+  fi
+  info "running 'garlic --defaults'..."
+  if quiet garlic-defaults garlic --defaults; then
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$sentinel"
+    ok "garlic defaults applied"
+  else
+    warn "garlic --defaults returned non-zero (continuing)"
+  fi
+  return 0
+}
+
+# phase_ps1 — write a hand-rolled vcs_info prompt to a standalone file that
+# RC_BLOCK sources. Bash + zsh variants, branch + dirty marker + short pwd,
+# zero external dependencies (plain `git status --porcelain`).
+phase_ps1() {
+  local dest_dir="$HOME/.local/share/sprite-setup"
+  local dest="$dest_dir/ps1.sh"
+  mkdir -p "$dest_dir"
+
+  local desired
+  desired=$(cat <<'PS1SH'
+# Hand-rolled vcs_info prompt. Sourced from RC_BLOCK in setup.sh.
+# Shows: user@host short-pwd (branch[*+]) $
+#   *  = unstaged changes
+#   +  = staged changes
+# Uses plain git plumbing; no external dependencies.
+
+__sprite_git_prompt() {
+  # Stay silent outside a git work tree.
+  local branch
+  branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null \
+            || git rev-parse --short HEAD 2>/dev/null)" || return 0
+  [ -z "$branch" ] && return 0
+  local status
+  status="$(git status --porcelain 2>/dev/null)"
+  local mark=""
+  # Staged: index column (col 1) is non-space and not '?'.
+  # Unstaged: worktree column (col 2) is non-space and not '?'.
+  if printf '%s\n' "$status" | grep -qE '^[^ ?]' 2>/dev/null; then mark+="+"; fi
+  if printf '%s\n' "$status" | grep -qE '^.[^ ?]' 2>/dev/null; then mark+="*"; fi
+  printf ' (%s%s)' "$branch" "$mark"
+}
+
+if [ -n "$BASH_VERSION" ]; then
+  PROMPT_COMMAND='__SPRITE_GP="$(__sprite_git_prompt)"; '"${PROMPT_COMMAND:-}"
+  # \[ \] wrap non-printing sequences so bash measures line width right.
+  PS1='\[\e[32m\]\u@\h\[\e[0m\] \[\e[34m\]\w\[\e[33m\]${__SPRITE_GP}\[\e[0m\] \$ '
+elif [ -n "$ZSH_VERSION" ]; then
+  # zsh: re-evaluate the function on every prompt via prompt_subst.
+  setopt prompt_subst
+  PROMPT='%F{green}%n@%m%f %F{blue}%~%F{yellow}$(__sprite_git_prompt)%f %# '
+fi
+PS1SH
+)
+
+  if [[ -f "$dest" && "$(cat "$dest")" == "$desired" && $FORCE -ne 1 ]]; then
+    skip "$dest already current"
+    return 0
+  fi
+  printf "%s\n" "$desired" > "$dest"
+  chmod 644 "$dest"
+  ok "wrote $dest"
+  return 0
+}
+
+# phase_zsh_completions — generate zsh completion files for tools that
+# support `<tool> completion zsh`. Drop them into ~/.zsh/completions/.
+# RC_BLOCK adds that dir to fpath and runs compinit.
+phase_zsh_completions() {
+  local comp_dir="$HOME/.zsh/completions"
+  mkdir -p "$comp_dir"
+
+  # tool name -> command to emit zsh completion script on stdout.
+  # Each line: "tool|cmd args..." (pipe separator to keep parsing simple).
+  local entries=(
+    "gh|gh completion -s zsh"
+    "flyctl|flyctl completion zsh"
+    "uv|uv generate-shell-completion zsh"
+    "cosign|cosign completion zsh"
+    "garlic|garlic --completion zsh"
+    "pre-commit|pre-commit completion zsh"
+  )
+
+  local wrote=0 skipped=0 unsupported=0
+  local entry tool cmd dest
+  for entry in "${entries[@]}"; do
+    tool="${entry%%|*}"
+    cmd="${entry#*|}"
+    dest="$comp_dir/_${tool}"
+
+    if ! command -v "${cmd%% *}" >/dev/null 2>&1; then
+      unsupported=$((unsupported + 1))
+      continue
+    fi
+    if [[ -f "$dest" && $FORCE -ne 1 ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    # Try to capture completion output; some tools return non-zero or
+    # print errors when they don't support zsh completion. Soft-fail.
+    if eval "$cmd" > "$dest.tmp" 2>"$PHASE_LOG_DIR/comp-$tool.log" && [[ -s "$dest.tmp" ]]; then
+      mv "$dest.tmp" "$dest"
+      chmod 644 "$dest"
+      wrote=$((wrote + 1))
+    else
+      rm -f "$dest.tmp"
+      unsupported=$((unsupported + 1))
+    fi
+  done
+
+  if [[ $wrote -gt 0 ]]; then
+    ok "wrote $wrote zsh completion file(s); $skipped already current; $unsupported not generated"
+  else
+    skip "no new zsh completion files (already current: $skipped; not generated: $unsupported)"
+  fi
+  return 0
+}
+
 phase_rc_additions() {
   RC_BLOCK=$(cat <<'EOF'
 
@@ -740,6 +1366,15 @@ fi
   source /usr/share/doc/fzf/examples/key-bindings.bash
 [ -f /usr/share/doc/fzf/examples/key-bindings.zsh ]  && [ -n "$ZSH_VERSION" ]  && \
   source /usr/share/doc/fzf/examples/key-bindings.zsh
+
+# zsh completions (managed by phase_zsh_completions)
+if [ -n "$ZSH_VERSION" ] && [ -d "$HOME/.zsh/completions" ]; then
+  fpath=("$HOME/.zsh/completions" $fpath)
+  autoload -Uz compinit && compinit -i
+fi
+
+# Custom PS1 (managed by phase_ps1)
+[ -f "$HOME/.local/share/sprite-setup/ps1.sh" ] && source "$HOME/.local/share/sprite-setup/ps1.sh"
 
 # Git aliases
 alias g='git'; alias gs='git status'; alias gst='git status'
@@ -874,27 +1509,48 @@ phase_verify() {
 # ============================================================================
 START_TIME=$(date +%s)
 
-run_phase apt_core          phase_apt_core
-run_phase corepack          phase_corepack
-run_phase uv                phase_uv
-run_phase semgrep           phase_semgrep
-run_phase garlic            phase_garlic
-run_phase cosign            phase_cosign
-run_phase trufflehog        phase_trufflehog
-run_phase docker            phase_docker
-run_phase dockerd_service   phase_dockerd_service
-run_phase flyctl            phase_flyctl
-run_phase claude_upgrade    phase_claude_upgrade
-run_phase claude_settings   phase_claude_settings
-run_phase ssh_known_hosts   phase_ssh_known_hosts
-run_phase git_identity      phase_git_identity
-run_phase ssh_key           phase_ssh_key
-run_phase gh_auth           phase_gh_auth
-run_phase gh_upload_keys    phase_gh_upload_keys
-run_phase git_signing       phase_git_signing
-run_phase clone_repos       phase_clone_repos
-run_phase rc_additions      phase_rc_additions
-run_phase verify            phase_verify
+# Bracket: pre-setup checkpoint (best-effort, never aborts the run).
+[[ -z "$ONLY_PHASE" ]] && bracket_phase pre_checkpoint phase_pre_checkpoint
+
+run_phase apt_core             phase_apt_core
+run_phase corepack             phase_corepack
+run_phase node_lts             phase_node_lts
+run_phase go_toolchain         phase_go_toolchain
+run_phase rust_toolchain       phase_rust_toolchain
+run_phase uv                   phase_uv
+run_phase black                phase_black
+run_phase garlic               phase_garlic
+run_phase pre_commit           phase_pre_commit
+run_phase ruff                 phase_ruff
+run_phase semgrep              phase_semgrep
+run_phase cosign               phase_cosign
+run_phase trufflehog           phase_trufflehog
+run_phase dive                 phase_dive
+run_phase gitleaks             phase_gitleaks
+run_phase hadolint             phase_hadolint
+run_phase docker               phase_docker
+run_phase dockerd_service      phase_dockerd_service
+run_phase flyctl               phase_flyctl
+run_phase claude_upgrade       phase_claude_upgrade
+run_phase claude_settings      phase_claude_settings
+run_phase pre_commit_template  phase_pre_commit_template
+run_phase gitignore_global     phase_gitignore_global
+run_phase ssh_known_hosts      phase_ssh_known_hosts
+run_phase git_identity         phase_git_identity
+run_phase ssh_key              phase_ssh_key
+run_phase gh_auth              phase_gh_auth
+run_phase gh_upload_keys       phase_gh_upload_keys
+run_phase git_signing          phase_git_signing
+run_phase clone_repos          phase_clone_repos
+run_phase garlic_defaults      phase_garlic_defaults
+run_phase ps1                  phase_ps1
+run_phase zsh_completions      phase_zsh_completions
+run_phase rc_additions         phase_rc_additions
+run_phase verify               phase_verify
+
+# Bracket: post-setup checkpoint (only if main loop completed; if verify
+# failed, run_phase would have already exited non-zero by here).
+[[ -z "$ONLY_PHASE" ]] && bracket_phase post_checkpoint phase_post_checkpoint
 
 ELAPSED=$(( $(date +%s) - START_TIME ))
 echo
@@ -925,4 +1581,5 @@ info "1. Open a new shell or run: source $RC_FILE"
 info "2. For docker without sudo: log out/in, or run 'newgrp docker'"
 info "3. Per-phase logs (if you want to inspect): $PHASE_LOG_DIR/"
 info "4. Re-run verify standalone with: ./post.sh"
+info "5. Phase state: ./setup.sh --status   (file: $STATE_FILE)"
 echo
