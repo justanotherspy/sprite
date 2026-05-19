@@ -14,7 +14,7 @@
 set -euo pipefail
 
 # ============================================================================
-# Pinned identity (FrootLoops / Daniel Schwartz)
+# Pinned identity (justanotherspy / Daniel Schwartz)
 # ============================================================================
 GIT_USER_NAME="Daniel Schwartz"
 GIT_USER_EMAIL="danielschwar@gmail.com"
