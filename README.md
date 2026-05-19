@@ -59,10 +59,13 @@ verify
 
 Two "bracket" phases run outside the main loop and are never aborting:
 
-* `pre_checkpoint` (before the first phase): `sprite-env checkpoint create --name pre-setup-<ts>`
-* `post_checkpoint` (after verify):           `sprite-env checkpoint create --name post-setup-<ts>`
+* `pre_checkpoint` (before the first phase): `sprite-env checkpoints create --comment "pre-setup-<ts>"`
+* `post_checkpoint` (after verify):           `sprite-env checkpoints create --comment "post-setup-<ts>"`
 
 If `sprite-env` is missing or the call fails, they log a warning and continue.
+sprite-env auto-assigns the checkpoint ID (`v0`, `v1`, `v2`, and so on);
+the `--comment` label is how you find the right one in
+`sprite-env checkpoints list`.
 
 ### What each phase does (compressed)
 
@@ -90,7 +93,7 @@ If `sprite-env` is missing or the call fails, they log a warning and continue.
 | `gh_upload_keys` | Uploads the ed25519 pub as both an auth key and a signing key, then retries `ssh -T git@github.com` until propagated. |
 | `git_signing` | Configures SSH commit signing using the same key. Writes `~/.ssh/allowed_signers`. |
 | `clone_repos` | Clones the four canonical repos under `~/repos/`. |
-| `garlic_defaults` | Runs `garlic --defaults`. Tracked via a sentinel file under the state dir. |
+| `garlic_defaults` | Runs `garlic setup --defaults -y`. Installs Claude hooks, the `/garlic` slash command, the nudge-relay `CLAUDE.md` instruction, and resets garlic's config to defaults. Idempotent. Sentinel: `~/.config/sprite-setup/garlic-defaults.applied`. |
 | `ps1` | Writes `~/.local/share/sprite-setup/ps1.sh` (vcs_info prompt, bash + zsh, no external deps). RC_BLOCK sources it. |
 | `zsh_completions` | Generates `~/.zsh/completions/_<tool>` for gh, flyctl, uv, cosign, garlic, pre-commit. RC_BLOCK adds the dir to `fpath` and runs `compinit`. |
 | `rc_additions` | Writes a single sentinel-delimited block to `~/.bashrc` and `~/.zshrc` (aliases, direnv hook, zoxide init, fzf keybindings, fpath, GH_TOKEN derivation). |
