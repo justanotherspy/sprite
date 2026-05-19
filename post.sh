@@ -172,9 +172,9 @@ log "Tool versions"
 # Binaries setup.sh is responsible for. Missing here = critical fail.
 SETUP_TOOLS=(
   shellcheck bat fd rg fzf ncdu mosh nvim btop direnv yq traceroute xclip
-  uv uvx semgrep trufflehog
+  uv uvx semgrep trufflehog cosign garlic
   docker
-  flyctl
+  flyctl sprite
   pnpm yarn
 )
 
@@ -243,6 +243,37 @@ for pair in "bat:/usr/bin/batcat" "fd:/usr/bin/fdfind"; do
     record_fail "symlink missing: $link -> $target" "$(
       kv "expected"          "$link -> $target"
       ls -la "$HOME/.local/bin/" 2>&1 | sed 's/^/  /'
+    )"
+  fi
+done
+
+sub "claude settings"
+if [[ -f "$HOME/.claude/settings.json" ]]; then
+  tui="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("tui",""))' \
+          "$HOME/.claude/settings.json" 2>/dev/null || echo "")"
+  if [[ "$tui" == "fullscreen" ]]; then
+    ok "~/.claude/settings.json has tui=fullscreen"
+  else
+    record_fail "~/.claude/settings.json missing or wrong tui value" "$(
+      kv "expected" "fullscreen"
+      kv "actual"   "${tui:-(unset)}"
+      echo
+      echo "Current settings.json:"
+      sed 's/^/  /' "$HOME/.claude/settings.json"
+    )"
+  fi
+else
+  record_fail "~/.claude/settings.json missing" ""
+fi
+
+sub "cloned repos in ~/repos"
+for repo in garlic poker sprite justanotherspy.com; do
+  if [[ -d "$HOME/repos/$repo/.git" ]]; then
+    ok "$HOME/repos/$repo present"
+  else
+    record_fail "$HOME/repos/$repo missing" "$(
+      kv "expected" "$HOME/repos/$repo/.git"
+      ls -la "$HOME/repos/" 2>&1 | sed 's/^/  /'
     )"
   fi
 done
