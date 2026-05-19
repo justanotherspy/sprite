@@ -13,7 +13,11 @@ Bootstrap and verification scripts for [sprites.dev](https://sprites.dev) — st
 ## Quick start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/justanotherspy/sprite/main/setup.sh | bash
+# Setup
+bash <(curl -fsSL https://raw.githubusercontent.com/justanotherspy/sprite/main/setup.sh)
+
+# Post Checks
+bash <(curl -fsSL https://raw.githubusercontent.com/justanotherspy/sprite/main/post.sh)
 ```
 
 ## What `setup.sh` installs
