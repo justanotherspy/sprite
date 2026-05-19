@@ -252,8 +252,13 @@ check_tool() {
     local p v ver_args
     p="$(command -v "$cmd")"
     ver_args="$(version_args_for "$cmd")"
+    # 5s timeout: semgrep is famously slow to print --version (Python import storm).
+    # grep -m1 '[0-9]': picks the first line containing a digit, which reliably
+    # skips ASCII-art banners (cosign) and empty lines while finding the real
+    # version line ("trufflehog 3.95.3" / "GitVersion: 3.0.6" / etc).
     # shellcheck disable=SC2086  # ver_args is a single word; intentional split
-    v="$(timeout 2 "$cmd" $ver_args </dev/null 2>&1 | head -n1)"
+    v="$(timeout 5 "$cmd" $ver_args </dev/null 2>&1 | grep -m1 -E '[0-9]' || true)"
+    [[ -z "$v" ]] && v="(version unavailable)"
     ok "$(printf '%-12s %-45s %s' "$cmd" "$p" "$v")"
     return
   fi
