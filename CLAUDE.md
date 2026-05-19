@@ -50,10 +50,3 @@ Verification-only script that checks versions of everything `setup.sh` was suppo
 - **Add a sprite Service**: follow the pattern in section 7b of `setup.sh`.
 - **Extend post-check smoke tests**: add a `sub` + command pair in `post.sh`.
 
-## Skills available
-
-| Skill | Trigger |
-|---|---|
-| `/pre-check` | Run the pre-setup inspection |
-| `/setup` | Bootstrap a new sprite |
-| `/post-check` | Verify setup completed correctly |
