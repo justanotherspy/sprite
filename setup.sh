@@ -191,7 +191,7 @@ ONLY_PHASE=""
 DO_STATUS=0
 PHASES=(
   apt_core
-  corepack node_lts go_toolchain rust_toolchain
+  corepack rust_toolchain
   uv black garlic pre_commit ruff semgrep
   cosign trufflehog dive gitleaks hadolint
   docker dockerd_service flyctl
@@ -421,71 +421,39 @@ phase_corepack() {
     warn "corepack not found (node missing?); skipping"
     return 0
   fi
-  if [[ $FORCE -ne 1 ]] && command -v pnpm >/dev/null 2>&1 && command -v yarn >/dev/null 2>&1; then
-    skip "pnpm and yarn already shimmed at $(dirname "$(command -v pnpm)")"
+
+  # Idempotency: presence of shims + sentinel from a prior successful prepare.
+  # `corepack prepare --activate` itself is idempotent (no-op when cached),
+  # but it still takes a couple of seconds, so we gate on a sentinel to keep
+  # repeat runs fast.
+  local sentinel="$STATE_DIR/corepack.prepared"
+  if [[ -f "$sentinel" && $FORCE -ne 1 ]] \
+     && command -v pnpm >/dev/null 2>&1 \
+     && command -v yarn >/dev/null 2>&1; then
+    skip "corepack enabled; pnpm + yarn already prepared (sentinel: $sentinel)"
     return 0
   fi
+
   info "enabling corepack (pnpm + yarn shims into ~/.local/bin)..."
   mkdir -p "$HOME/.local/bin"
   quiet corepack corepack enable --install-directory "$HOME/.local/bin" \
-    || warn "corepack enable failed (non-fatal)"
+    || return 1
+
+  # Pre-activate so the first `pnpm`/`yarn` call doesn't hit corepack's
+  # interactive download prompt. Soft-fail: the shims still work, the user
+  # just gets the prompt once on first use.
+  info "pre-activating pnpm and yarn (downloads packages now, not on first use)..."
+  quiet corepack-prepare-pnpm corepack prepare pnpm@latest --activate \
+    || warn "corepack prepare pnpm failed (non-fatal; first pnpm use will retry)"
+  quiet corepack-prepare-yarn corepack prepare yarn@stable --activate \
+    || warn "corepack prepare yarn failed (non-fatal; first yarn use will retry)"
+
   if command -v pnpm >/dev/null 2>&1 && command -v yarn >/dev/null 2>&1; then
-    ok "corepack enabled (pnpm + yarn on PATH)"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$sentinel"
+    ok "corepack enabled; pnpm/yarn activated"
   else
-    warn "corepack enable returned 0 but shims still missing; check $PHASE_LOG_DIR/corepack.log"
+    warn "corepack actions completed but shims still missing; check $PHASE_LOG_DIR/corepack.log"
   fi
-  return 0
-}
-
-# phase_node_lts — ensure node is on the current LTS major via nvm.
-# The sprite ships node 22.x (LTS at time of writing); if that's already
-# the case we skip. Otherwise we source nvm and install --lts.
-phase_node_lts() {
-  local nvm_sh="/.sprite/languages/node/nvm/nvm.sh"
-  if [[ ! -f "$nvm_sh" ]]; then
-    warn "nvm not found at $nvm_sh; skipping (sprite base image may have drifted)"
-    return 0
-  fi
-  if ! command -v node >/dev/null 2>&1; then
-    warn "node not on PATH; skipping (sprite base image issue)"
-    return 0
-  fi
-
-  # Current LTS major. Hard-coded conservatively; bump when LTS rolls over.
-  local lts_major=22
-  local cur_major
-  cur_major="$(node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1)"
-
-  if [[ "$cur_major" == "$lts_major" && $FORCE -ne 1 ]]; then
-    skip "node already on LTS major (v${cur_major}.x); nothing to do"
-    return 0
-  fi
-
-  info "installing node --lts via nvm (current major: ${cur_major:-unknown}, target: $lts_major)..."
-  # nvm.sh expects bash; source in a subshell-style block to avoid leaking vars.
-  # shellcheck disable=SC1090
-  if quiet node-lts bash -c "set -e; source '$nvm_sh'; nvm install --lts && nvm alias default 'lts/*'"; then
-    ok "node LTS installed/updated"
-  else
-    return 1
-  fi
-  return 0
-}
-
-# phase_go_toolchain — trust the sprite-provided go.
-# Rationale: the sprite ships a recent stable go under /.sprite/bin/go, and
-# the sprite docs explicitly say not to reinstall pre-installed toolchains.
-# This phase exists for symmetry/visibility in --status output and does NOT
-# touch the go install. If you need a different go version, use sprite-env
-# to manage it, not this script.
-phase_go_toolchain() {
-  if ! command -v go >/dev/null 2>&1; then
-    warn "go not on PATH; expected sprite-provided go under /.sprite/bin/"
-    return 0
-  fi
-  local v
-  v="$(go version 2>/dev/null | awk '{print $3}' || echo unknown)"
-  note "using sprite-provided go ($v); skipping reinstall by design"
   return 0
 }
 
@@ -1287,18 +1255,17 @@ phase_zsh_completions() {
   local comp_dir="$HOME/.zsh/completions"
   mkdir -p "$comp_dir"
 
-  # tool name -> command to emit zsh completion script on stdout.
-  # Each line: "tool|cmd args..." (pipe separator to keep parsing simple).
+  # tool name -> command that emits the zsh completion script on stdout.
+  # garlic and pre-commit removed: garlic 0.2.x has no completion subcommand,
+  # pre-commit 4.x exposes no `completion zsh`. Re-add if upstream changes.
   local entries=(
     "gh|gh completion -s zsh"
     "flyctl|flyctl completion zsh"
     "uv|uv generate-shell-completion zsh"
     "cosign|cosign completion zsh"
-    "garlic|garlic --completion zsh"
-    "pre-commit|pre-commit completion zsh"
   )
 
-  local wrote=0 skipped=0 unsupported=0
+  local wrote_tools=() skipped_tools=() failed_tools=()
   local entry tool cmd dest
   for entry in "${entries[@]}"; do
     tool="${entry%%|*}"
@@ -1306,29 +1273,35 @@ phase_zsh_completions() {
     dest="$comp_dir/_${tool}"
 
     if ! command -v "${cmd%% *}" >/dev/null 2>&1; then
-      unsupported=$((unsupported + 1))
+      failed_tools+=("$tool(not-installed)")
       continue
     fi
     if [[ -f "$dest" && $FORCE -ne 1 ]]; then
-      skipped=$((skipped + 1))
+      skipped_tools+=("$tool")
       continue
     fi
-    # Try to capture completion output; some tools return non-zero or
-    # print errors when they don't support zsh completion. Soft-fail.
     if eval "$cmd" > "$dest.tmp" 2>"$PHASE_LOG_DIR/comp-$tool.log" && [[ -s "$dest.tmp" ]]; then
       mv "$dest.tmp" "$dest"
       chmod 644 "$dest"
-      wrote=$((wrote + 1))
+      wrote_tools+=("$tool")
     else
       rm -f "$dest.tmp"
-      unsupported=$((unsupported + 1))
+      failed_tools+=("$tool")
     fi
   done
 
-  if [[ $wrote -gt 0 ]]; then
-    ok "wrote $wrote zsh completion file(s); $skipped already current; $unsupported not generated"
+  # Format: name lists, not counts. Future-you debugging a failure wants
+  # the tool name, not a number.
+  local wrote_str="${wrote_tools[*]:-(none)}"
+  local skipped_str="${skipped_tools[*]:-(none)}"
+  local failed_str="${failed_tools[*]:-(none)}"
+
+  if [[ ${#wrote_tools[@]} -gt 0 ]]; then
+    ok "wrote: $wrote_str | current: $skipped_str | failed: $failed_str"
+  elif [[ ${#failed_tools[@]} -gt 0 ]]; then
+    warn "no new completions | current: $skipped_str | failed: $failed_str"
   else
-    skip "no new zsh completion files (already current: $skipped; not generated: $unsupported)"
+    skip "all completions current: $skipped_str"
   fi
   return 0
 }
@@ -1519,8 +1492,6 @@ START_TIME=$(date +%s)
 
 run_phase apt_core             phase_apt_core
 run_phase corepack             phase_corepack
-run_phase node_lts             phase_node_lts
-run_phase go_toolchain         phase_go_toolchain
 run_phase rust_toolchain       phase_rust_toolchain
 run_phase uv                   phase_uv
 run_phase black                phase_black
