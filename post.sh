@@ -394,16 +394,26 @@ else
   record_fail "$ssh_dir does not exist" "$(ssh_diag)"
 fi
 
-sub "known_hosts (github.com)"
-if [[ -f "$known" ]] && ssh-keygen -F github.com -f "$known" >/dev/null 2>&1; then
-  ok "github.com host key in $known"
+sub "known_hosts (github.com, expected mode 644)"
+if [[ ! -f "$known" ]]; then
+  record_fail "$known missing" "$(ssh_diag)"
 else
-  record_fail "github.com missing from known_hosts" "$(
-    kv "known_hosts" "$known ($(stat -c '%a' "$known" 2>/dev/null || echo '(absent)'))"
-    echo
-    echo "ssh-keygen -F github.com:"
-    ssh-keygen -F github.com -f "$known" 2>&1 | sed 's/^/  /'
-  )"
+  mode="$(stat -c '%a' "$known")"
+  if [[ "$mode" == "644" ]]; then
+    ok "$known mode=644"
+  else
+    record_fail "$known wrong mode: $mode (expected 644)" "$(ssh_diag)"
+  fi
+  if ssh-keygen -F github.com -f "$known" >/dev/null 2>&1; then
+    ok "github.com host key in $known"
+  else
+    record_fail "github.com missing from known_hosts" "$(
+      kv "known_hosts" "$known (mode=$mode)"
+      echo
+      echo "ssh-keygen -F github.com:"
+      ssh-keygen -F github.com -f "$known" 2>&1 | sed 's/^/  /'
+    )"
+  fi
 fi
 
 sub "id_ed25519 (private; expected mode 600)"
@@ -430,8 +440,16 @@ else
   record_fail "$pub missing" "$(ssh_diag)"
 fi
 
-sub "allowed_signers"
-if [[ -f "$signers" ]]; then
+sub "allowed_signers (expected mode 644)"
+if [[ ! -f "$signers" ]]; then
+  record_fail "$signers missing" "$(ssh_diag)"
+else
+  mode="$(stat -c '%a' "$signers")"
+  if [[ "$mode" == "644" ]]; then
+    ok "$signers mode=644"
+  else
+    record_fail "$signers wrong mode: $mode (expected 644)" "$(ssh_diag)"
+  fi
   # Expected line: "${GIT_USER_EMAIL} namespaces=\"git\" $(cat "$pub")"
   if [[ -f "$pub" ]] && grep -qF "$(cat "$pub")" "$signers" 2>/dev/null \
      && grep -qE "^${GIT_USER_EMAIL//./\\.}[[:space:]]+namespaces=\"git\"[[:space:]]+ssh-ed25519[[:space:]]+" "$signers"; then
@@ -439,7 +457,7 @@ if [[ -f "$signers" ]]; then
   else
     record_fail "$signers does not contain the expected entry" "$(
       kv "expected pattern" "${GIT_USER_EMAIL} namespaces=\"git\" ssh-ed25519 <body>"
-      kv "signers mode"     "$(stat -c '%a' "$signers" 2>/dev/null || echo '(absent)')"
+      kv "signers mode"     "$mode"
       echo
       echo "First line of allowed_signers:"
       head -n1 "$signers" 2>&1 | sed 's/^/  /'
@@ -451,8 +469,6 @@ if [[ -f "$signers" ]]; then
       ssh-keygen -y -f "$priv" 2>&1 | sed 's/^/  /'
     )"
   fi
-else
-  record_fail "$signers missing" "$(ssh_diag)"
 fi
 
 sub "ssh -T git@github.com (authenticated end-to-end)"
@@ -587,6 +603,65 @@ else
   )"
 fi
 
+sub "key body match (local id_ed25519.pub vs github)"
+# Title presence alone doesn't guarantee the GitHub-side key matches the
+# local one. If the local key was rotated and the upload phase failed
+# silently, titles would still exist but signing/auth would break.
+# Compare fingerprints to catch that.
+if [[ ! -f "$pub" ]]; then
+  warn "skipping fingerprint match (id_ed25519.pub missing; see SSH section)"
+elif ! command -v ssh-keygen >/dev/null 2>&1; then
+  warn "skipping fingerprint match (ssh-keygen not on PATH)"
+else
+  local_fp="$(ssh-keygen -lf "$pub" 2>/dev/null | awk '{print $2}')"
+  if [[ -z "$local_fp" ]]; then
+    record_fail "could not compute local fingerprint from $pub" "$(
+      echo "ssh-keygen -lf $pub:"
+      ssh-keygen -lf "$pub" 2>&1 | sed 's/^/  /'
+    )"
+  else
+    # gh_fp_for <title> <endpoint>
+    # Fetch the key body for the named title and return its SHA256 fp.
+    gh_fp_for() {
+      local title="$1" endpoint="$2" body
+      body="$(gh api "$endpoint" --jq ".[] | select(.title==\"$title\") | .key" 2>/dev/null)"
+      [[ -z "$body" ]] && return 1
+      printf '%s\n' "$body" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}'
+    }
+
+    for pair in "auth:$title_auth:user/keys" "signing:$title_sign:user/ssh_signing_keys"; do
+      kind="${pair%%:*}"
+      rest="${pair#*:}"
+      title="${rest%%:*}"
+      endpoint="${rest##*:}"
+      # Only attempt if the title was actually found above.
+      if [[ "$kind" == "auth"    ]] && ! grep -qFx "$title" <<<"$auth_titles"; then continue; fi
+      if [[ "$kind" == "signing" ]] && ! grep -qFx "$title" <<<"$sign_titles"; then continue; fi
+
+      gh_fp="$(gh_fp_for "$title" "$endpoint" || true)"
+      if [[ -z "$gh_fp" ]]; then
+        record_fail "could not fetch github $kind key body for '$title'" "$(
+          kv "title"    "$title"
+          kv "endpoint" "$endpoint"
+          echo
+          echo "gh api $endpoint --jq '.[] | select(.title==\"$title\") | .key':"
+          gh api "$endpoint" --jq ".[] | select(.title==\"$title\") | .key" 2>&1 | sed 's/^/  /'
+        )"
+      elif [[ "$gh_fp" == "$local_fp" ]]; then
+        ok "$kind key on github ($title) matches local pub ($local_fp)"
+      else
+        record_fail "$kind key on github does NOT match local id_ed25519.pub" "$(
+          kv "title"             "$title"
+          kv "local fingerprint" "$local_fp"
+          kv "github fingerprint" "$gh_fp"
+          echo
+          echo "(fix: remove the stale key from GitHub and re-run setup.sh --only gh_upload_keys --force)"
+        )"
+      fi
+    done
+  fi
+fi
+
 # ============================================================================
 # 6. Git config (global)
 # ============================================================================
@@ -627,6 +702,42 @@ check_git_config() {
     record_fail "git config $key wrong" "$(git_diag_for "$key" "$expected" "$actual")"
   fi
 }
+
+sub "overriding gitconfig sources"
+# Git's resolution: $XDG_CONFIG_HOME/git/config (default ~/.config/git/config)
+# and /etc/gitconfig both rank below ~/.gitconfig for single-valued vars, BUT
+# if anyone removes the identity from ~/.gitconfig later, a stale value in
+# either file silently wins. Fail loudly on conflict, warn on duplication.
+override_problems=()
+override_warnings=()
+for src in "/etc/gitconfig" "$HOME/.config/git/config"; do
+  [[ -f "$src" ]] || continue
+  for key in user.name user.email; do
+    val="$(git config --file "$src" --get "$key" 2>/dev/null || true)"
+    [[ -z "$val" ]] && continue
+    expected_val="$GIT_USER_NAME"
+    [[ "$key" == "user.email" ]] && expected_val="$GIT_USER_EMAIL"
+    if [[ "$val" != "$expected_val" ]]; then
+      override_problems+=("$src sets $key=$val (expected: $expected_val)")
+    else
+      override_warnings+=("$src sets $key=$val (matches; remove for clarity)")
+    fi
+  done
+done
+if [[ ${#override_problems[@]} -gt 0 ]]; then
+  diag=""
+  for p in "${override_problems[@]}"; do diag+="$p"$'\n'; done
+  diag+=$'\n'"resolved value (what git actually uses):"$'\n'
+  diag+="  user.name  = $(git config --get user.name)"$'\n'
+  diag+="  user.email = $(git config --get user.email)"$'\n'
+  diag+=$'\n'"(fix: remove user.* from /etc/gitconfig and ~/.config/git/config so ~/.gitconfig is the only source)"
+  record_fail "non-global gitconfig sets a conflicting user.*" "$diag"
+elif [[ ${#override_warnings[@]} -gt 0 ]]; then
+  warn "non-global gitconfig also sets user.* (matches expected, but is a future-trap):"
+  for w in "${override_warnings[@]}"; do printf "    %s\n" "$w"; done
+else
+  ok "no overriding gitconfig sets user.name or user.email"
+fi
 
 sub "identity + defaults"
 check_git_config user.name           "$GIT_USER_NAME"
@@ -951,7 +1062,30 @@ else
 fi
 
 # ============================================================================
-# 11. Summary
+# 11. Disk
+# ============================================================================
+log "Disk"
+
+# Sprites have a filesystem quota. Warn at >=80%, fail at >=95%.
+# Use --output=pcent so we don't have to parse the variable-width df header.
+root_pct_raw="$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')"
+if [[ -z "$root_pct_raw" ]]; then
+  warn "could not parse df output for /"
+  df -h / 2>&1 | sed 's/^/    /'
+else
+  df_line="$(df -h / | tail -1 | tr -s ' ')"
+  if   (( root_pct_raw >= 95 )); then
+    record_fail "/ is ${root_pct_raw}% full (>= 95%; setup.sh re-runs may fail)" "$(df -h / 2>&1)"
+  elif (( root_pct_raw >= 80 )); then
+    warn "/ is ${root_pct_raw}% full (>= 80%; clean up before next setup.sh re-run)"
+    printf "    %s\n" "$df_line"
+  else
+    ok "/ at ${root_pct_raw}% ($df_line)"
+  fi
+fi
+
+# ============================================================================
+# 12. Summary
 # ============================================================================
 log "Summary"
 printf "    %s+%s pass : %d\n" "$GREEN"  "$RESET" "$PASS"
