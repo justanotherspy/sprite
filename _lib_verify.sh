@@ -87,6 +87,19 @@ record_fail() {
 kv() { printf "%-32s : %s\n" "$1" "$2"; }
 
 # ============================================================================
+# Per-tool --version invocation. Some CLIs reject `--version` (cosign 3.x
+# uses the `version` subcommand, go uses `version`, gitleaks too). Returning
+# from a lookup table keeps the version column readable instead of showing
+# "Error: unknown flag: --version".
+# ============================================================================
+version_args_for() {
+  case "$1" in
+    cosign|gitleaks|go) printf 'version' ;;
+    *)                  printf '%s' '--version' ;;
+  esac
+}
+
+# ============================================================================
 # RC sentinels + expected block (must byte-match setup.sh's RC_BLOCK heredoc)
 # ============================================================================
 RC_OPEN_SENTINEL="# >>> dev-env-setup shell additions >>>"
@@ -131,6 +144,15 @@ fi
   source /usr/share/doc/fzf/examples/key-bindings.bash
 [ -f /usr/share/doc/fzf/examples/key-bindings.zsh ]  && [ -n "$ZSH_VERSION" ]  && \
   source /usr/share/doc/fzf/examples/key-bindings.zsh
+
+# zsh completions (managed by phase_zsh_completions)
+if [ -n "$ZSH_VERSION" ] && [ -d "$HOME/.zsh/completions" ]; then
+  fpath=("$HOME/.zsh/completions" $fpath)
+  autoload -Uz compinit && compinit -i
+fi
+
+# Custom PS1 (managed by phase_ps1)
+[ -f "$HOME/.local/share/sprite-setup/ps1.sh" ] && source "$HOME/.local/share/sprite-setup/ps1.sh"
 
 # Git aliases
 alias g='git'; alias gs='git status'; alias gst='git status'
@@ -184,6 +206,9 @@ REQUIRED_RC_STRINGS=(
   'eval "$(zoxide init zsh)"'
   '/usr/share/doc/fzf/examples/key-bindings.bash'
   '/usr/share/doc/fzf/examples/key-bindings.zsh'
+  '$HOME/.zsh/completions'
+  'autoload -Uz compinit && compinit -i'
+  '$HOME/.local/share/sprite-setup/ps1.sh'
   "alias gl='git log --oneline --graph --decorate'"
   "alias gp='git pull --rebase'"
   "alias d='docker'"
@@ -200,19 +225,21 @@ extract_rc_block() {
 # Tool inventory
 # ============================================================================
 # Binaries setup.sh is responsible for. Missing here = critical fail.
-# Wave A additions: tmux, tldr, hyperfine, zoxide
+# Wave A additions: tmux, tldr, hyperfine, zoxide (tldr provided by tealdeer).
+# Wave B additions: hadolint, dive, gitleaks, ruff, black, pre-commit.
 SETUP_TOOLS=(
   shellcheck bat fd rg fzf jq ncdu mosh nvim btop direnv yq traceroute xclip
   tmux tldr hyperfine zoxide
   uv uvx semgrep trufflehog cosign garlic
+  black pre-commit ruff
+  dive gitleaks hadolint
   docker
   flyctl
   pnpm yarn
 )
 
 # Pre-installed by the sprite base image. Missing here = warn (the sprite
-# itself drifted, not setup.sh). 'sprite' moved here from SETUP_TOOLS in
-# Wave A removals since the sprite CLI ships with the base image.
+# itself drifted, not setup.sh).
 SPRITE_TOOLS=(
   gh node npm bun deno python3 pip go ruby rustc cargo elixir java
   claude gemini codex
@@ -222,9 +249,11 @@ SPRITE_TOOLS=(
 check_tool() {
   local cmd="$1" criticality="$2"   # criticality: critical | sprite
   if command -v "$cmd" >/dev/null 2>&1; then
-    local p v
+    local p v ver_args
     p="$(command -v "$cmd")"
-    v="$(timeout 2 "$cmd" --version </dev/null 2>&1 | head -n1)"
+    ver_args="$(version_args_for "$cmd")"
+    # shellcheck disable=SC2086  # ver_args is a single word; intentional split
+    v="$(timeout 2 "$cmd" $ver_args </dev/null 2>&1 | head -n1)"
     ok "$(printf '%-12s %-45s %s' "$cmd" "$p" "$v")"
     return
   fi
@@ -824,6 +853,7 @@ verify_git_config() {
   check_git_config rerere.enabled       "true"
   check_git_config fetch.prune          "true"
   check_git_config core.editor          "vim"
+  check_git_config core.excludesFile    "$HOME/.gitignore_global"
 
   sub "aliases"
   local EXPECTED_ALIASES=(lg last amend unstage cleanb) a v
@@ -1006,7 +1036,84 @@ verify_rc_files() {
 }
 
 # ============================================================================
-# 9. Security: scan rc files for plaintext PATs
+# 9. Dotfiles managed by Wave B phases
+# ============================================================================
+verify_dotfiles() {
+  log "Dotfiles (Wave B)"
+
+  sub "~/.gitignore_global"
+  local gi="$HOME/.gitignore_global"
+  if [[ -f "$gi" ]]; then
+    local mode
+    mode="$(stat -c '%a' "$gi")"
+    if [[ "$mode" == "644" ]]; then
+      ok "$gi present (mode=644, $(wc -l < "$gi") lines)"
+    else
+      record_fail "$gi wrong mode: $mode (expected 644)" ""
+    fi
+    local s
+    for s in node_modules __pycache__ .DS_Store '.venv/' '.idea/'; do
+      if grep -qF "$s" "$gi"; then
+        ok "$gi contains '$s'"
+      else
+        record_fail "$gi missing entry: $s" ""
+      fi
+    done
+  else
+    record_fail "$gi missing" "$(
+      kv "expected" "$gi (mode 644)"
+      ls -la "$HOME/" 2>&1 | grep -E '\.gitignore' | sed 's/^/  /' || echo "  (no .gitignore* files in HOME)"
+    )"
+  fi
+
+  sub "pre-commit template"
+  local tmpl="$HOME/.config/pre-commit/.pre-commit-config.template.yaml"
+  if [[ -f "$tmpl" ]]; then
+    ok "$tmpl present"
+    local hook
+    for hook in ruff black shellcheck-precommit semgrep gitleaks trufflehog; do
+      if grep -qF "$hook" "$tmpl"; then
+        ok "template references '$hook'"
+      else
+        record_fail "template missing reference to '$hook'" ""
+      fi
+    done
+  else
+    record_fail "$tmpl missing" ""
+  fi
+
+  sub "PS1 file"
+  local ps1="$HOME/.local/share/sprite-setup/ps1.sh"
+  if [[ -f "$ps1" ]]; then
+    ok "$ps1 present"
+    if grep -qF '__sprite_git_prompt' "$ps1"; then
+      ok "ps1.sh defines __sprite_git_prompt"
+    else
+      record_fail "ps1.sh present but missing __sprite_git_prompt function" "$(
+        echo "first 20 lines:"; head -n 20 "$ps1" | sed 's/^/  /'
+      )"
+    fi
+  else
+    record_fail "$ps1 missing" ""
+  fi
+
+  sub "zsh completions dir"
+  local cdir="$HOME/.zsh/completions"
+  if [[ -d "$cdir" ]]; then
+    local n
+    n="$(find "$cdir" -maxdepth 1 -type f -name '_*' 2>/dev/null | wc -l)"
+    if [[ "$n" -gt 0 ]]; then
+      ok "$cdir has $n completion file(s)"
+    else
+      warn "$cdir present but empty (no tool emitted a completion script)"
+    fi
+  else
+    record_fail "$cdir missing" ""
+  fi
+}
+
+# ============================================================================
+# 10. Security: scan rc files for plaintext PATs
 # ============================================================================
 verify_security() {
   log "Security (plaintext PAT scan)"
@@ -1047,7 +1154,7 @@ verify_security() {
 }
 
 # ============================================================================
-# 10. End-to-end signing smoke test
+# 11. End-to-end signing smoke test
 # ============================================================================
 verify_signing_smoke() {
   log "Signing smoke test"
@@ -1111,7 +1218,7 @@ verify_signing_smoke() {
 }
 
 # ============================================================================
-# 11. Disk
+# 12. Disk
 # ============================================================================
 verify_disk() {
   log "Disk"
@@ -1147,6 +1254,7 @@ verify_run_all() {
   verify_git_config
   verify_git_signing
   verify_rc_files
+  verify_dotfiles
   verify_security
   verify_signing_smoke
   verify_disk
