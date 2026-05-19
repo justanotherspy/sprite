@@ -48,7 +48,7 @@ corepack rust_toolchain
 uv black garlic pre_commit ruff semgrep
 cosign trufflehog dive gitleaks hadolint
 docker dockerd_service flyctl
-claude_upgrade claude_settings
+claude_upgrade claude_statusline claude_settings
 pre_commit_template gitignore_global
 ssh_known_hosts git_identity ssh_key
 gh_auth gh_upload_keys git_signing
@@ -81,7 +81,8 @@ the `--comment` label is how you find the right one in
 | `dockerd_service` | Registers `dockerd` as a sprite-env Service so it survives hibernation. |
 | `flyctl` | Installs `flyctl` to `~/.fly/bin`. |
 | `claude_upgrade` | `claude upgrade`. |
-| `claude_settings` | Writes `tui: "fullscreen"` to `~/.claude/settings.json`. |
+| `claude_statusline` | Sets up Claude statusline. |
+| `claude_settings` | Writes `tui: "fullscreen"` and other settings to `~/.claude/settings.json`. |
 | `pre_commit_template` | Writes `~/.config/pre-commit/.pre-commit-config.template.yaml` (ruff, black, shellcheck, semgrep, gitleaks, trufflehog). Copy it into a repo and run `pre-commit install`. |
 | `gitignore_global` | Writes `~/.gitignore_global` and wires `git config --global core.excludesFile` to it. |
 | `ssh_known_hosts` | Pre-loads `github.com` host keys. |
