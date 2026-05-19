@@ -161,6 +161,7 @@ phase_corepack() {
     return 0
   fi
   corepack enable >/dev/null 2>&1 || warn "corepack enable failed (non-fatal)"
+  return 0
 }
 
 phase_uv() {
@@ -170,6 +171,7 @@ phase_uv() {
   fi
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
+  return 0
 }
 
 phase_semgrep() {
@@ -178,6 +180,7 @@ phase_semgrep() {
     return 0
   fi
   "$HOME/.local/bin/uv" tool install semgrep
+  return 0
 }
 
 phase_trufflehog() {
@@ -187,6 +190,7 @@ phase_trufflehog() {
   fi
   curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
     | $SUDO sh -s -- -b /usr/local/bin
+  return 0
 }
 
 phase_docker() {
@@ -238,6 +242,7 @@ phase_docker() {
 }
 JSON
   fi
+  return 0
 }
 
 phase_dockerd_service() {
@@ -270,6 +275,7 @@ phase_dockerd_service() {
     err "sprite-env services create exited with $rc"
     return 1
   fi
+  return 0
 }
 
 phase_flyctl() {
@@ -279,6 +285,7 @@ phase_flyctl() {
   fi
   curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive
   export PATH="$HOME/.fly/bin:$PATH"
+  return 0
 }
 
 phase_ssh_known_hosts() {
@@ -291,6 +298,7 @@ phase_ssh_known_hosts() {
     return 0
   fi
   ssh-keyscan -t rsa,ecdsa,ed25519 github.com 2>/dev/null >> "$HOME/.ssh/known_hosts"
+  return 0
 }
 
 phase_git_identity() {
@@ -332,6 +340,7 @@ phase_git_identity() {
   git config --global alias.amend   "commit --amend --no-edit"
   git config --global alias.unstage "reset HEAD --"
   git config --global alias.cleanb  "!git branch --merged | grep -vE '^\\*|^.\\s*(main|master|develop)$' | xargs -r git branch -d"
+  return 0
 }
 
 phase_ssh_key() {
@@ -351,6 +360,7 @@ phase_ssh_key() {
     -f "$key" -N ""
   eval "$(ssh-agent -s)" >/dev/null
   ssh-add "$key" >/dev/null 2>&1 || true
+  return 0
 }
 
 phase_gh_auth() {
@@ -396,6 +406,7 @@ phase_gh_auth() {
     return 1
   fi
   ok "gh authenticated as $who"
+  return 0
 }
 
 phase_gh_upload_keys() {
@@ -439,6 +450,7 @@ phase_gh_upload_keys() {
     sleep 2
   done
   warn "github SSH auth not verified after $max attempts (retry: ssh -T git@github.com)"
+  return 0
 }
 phase_git_signing() {
   local pub="$HOME/.ssh/id_ed25519.pub"
@@ -458,6 +470,7 @@ phase_git_signing() {
     chmod 644 "$signers"
     ok "wrote $signers"
   fi
+  return 0
 }
 
 phase_rc_additions() {
@@ -532,6 +545,7 @@ EOF
     printf "%s\n" "$RC_BLOCK" >> "$rc"
   done
   chmod 644 "$HOME/.bashrc" "$HOME/.zshrc" 2>/dev/null || true
+  return 0
 }
 
 # ============================================================================
