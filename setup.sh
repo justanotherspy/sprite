@@ -66,10 +66,11 @@ mkdir -p "$PHASE_LOG_DIR"
 quiet() {
   local label="$1"; shift
   local log="$PHASE_LOG_DIR/${label}.log"
-  if "$@" >"$log" 2>&1; then
+  local rc=0
+  "$@" >"$log" 2>&1 || rc=$?
+  if [[ $rc -eq 0 ]]; then
     return 0
   fi
-  local rc=$?
   err "$label failed (rc=$rc); last 40 lines below (full log: $log):"
   tail -n 40 "$log" 2>/dev/null | sed 's/^/    /' >&2 || true
   return $rc
@@ -111,7 +112,7 @@ PHASE_DID_WORK=0     # toggled to 1 by ok() inside a phase
 FORCE=0
 ONLY_PHASE=""
 PHASES=(
-  apt_core corepack uv semgrep garlic trufflehog cosign
+  apt_core corepack uv semgrep garlic cosign trufflehog
   docker dockerd_service flyctl sprite_cli
   claude_upgrade claude_settings
   ssh_known_hosts git_identity ssh_key
@@ -286,7 +287,12 @@ phase_trufflehog() {
     skip "trufflehog already installed"
     return 0
   fi
-  info "installing trufflehog (with checksum verification)..."
+  if ! command -v cosign >/dev/null 2>&1; then
+    err "cosign must be installed before trufflehog (-v requires it for signature verification)"
+    err "run: ./setup.sh --only cosign"
+    return 1
+  fi
+  info "installing trufflehog (with cosign signature verification)..."
   quiet trufflehog bash -c \
     'curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
        | '"$SUDO"' sh -s -- -v -b /usr/local/bin'
@@ -301,9 +307,12 @@ phase_cosign() {
   fi
 
   info "resolving latest cosign release tag..."
-  local latest_version
-  latest_version="$(curl -fsSL https://api.github.com/repos/sigstore/cosign/releases/latest \
-    | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')"
+  local api_json latest_version
+  if ! api_json="$(curl -fsSL https://api.github.com/repos/sigstore/cosign/releases/latest 2>/dev/null)"; then
+    err "could not fetch cosign release info from GitHub API"
+    return 1
+  fi
+  latest_version="$(printf '%s\n' "$api_json" | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')"
   if [[ -z "$latest_version" ]]; then
     err "could not parse cosign tag_name from GitHub API"
     return 1
@@ -822,8 +831,8 @@ run_phase corepack          phase_corepack
 run_phase uv                phase_uv
 run_phase semgrep           phase_semgrep
 run_phase garlic            phase_garlic
-run_phase trufflehog        phase_trufflehog
 run_phase cosign            phase_cosign
+run_phase trufflehog        phase_trufflehog
 run_phase docker            phase_docker
 run_phase dockerd_service   phase_dockerd_service
 run_phase flyctl            phase_flyctl
