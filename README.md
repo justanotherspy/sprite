@@ -65,3 +65,7 @@ Three skills are included under `.claude/skills/` for common workflows:
 - **`setup.sh` is idempotent** — safe to re-run if it's interrupted.
 - **No systemd** — sprites use `tini` as PID 1; Docker is kept alive via a sprite Service.
 - Logs are written to `/tmp/*.log` and printed to stdout with ANSI colours stripped in the log copy.
+
+## Documentation
+
+Spites docs are here: https://github.com/superfly/sprites-docs/tree/main/src/content/docs
