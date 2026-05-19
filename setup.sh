@@ -111,10 +111,12 @@ PHASE_DID_WORK=0     # toggled to 1 by ok() inside a phase
 FORCE=0
 ONLY_PHASE=""
 PHASES=(
-  apt_core corepack uv semgrep trufflehog
-  docker dockerd_service flyctl
+  apt_core corepack uv semgrep garlic trufflehog cosign
+  docker dockerd_service flyctl sprite_cli
+  claude_upgrade claude_settings
   ssh_known_hosts git_identity ssh_key
   gh_auth gh_upload_keys git_signing
+  clone_repos
   rc_additions
 )
 while [[ $# -gt 0 ]]; do
@@ -268,16 +270,62 @@ phase_semgrep() {
   return 0
 }
 
+phase_garlic() {
+  if [[ $FORCE -ne 1 ]] && command -v garlic >/dev/null 2>&1; then
+    skip "garlic already installed ($(garlic --version 2>&1 | head -1))"
+    return 0
+  fi
+  info "installing garlic-cli via uv tool install..."
+  quiet garlic "$HOME/.local/bin/uv" tool install garlic-cli
+  ok "garlic-cli installed"
+  return 0
+}
+
 phase_trufflehog() {
   if [[ $FORCE -ne 1 ]] && command -v trufflehog >/dev/null 2>&1; then
     skip "trufflehog already installed"
     return 0
   fi
-  info "installing trufflehog..."
+  info "installing trufflehog (with checksum verification)..."
   quiet trufflehog bash -c \
     'curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-       | '"$SUDO"' sh -s -- -b /usr/local/bin'
+       | '"$SUDO"' sh -s -- -v -b /usr/local/bin'
   ok "trufflehog installed"
+  return 0
+}
+
+phase_cosign() {
+  if [[ $FORCE -ne 1 ]] && command -v cosign >/dev/null 2>&1; then
+    skip "cosign already installed ($(cosign version --short 2>&1 | head -1))"
+    return 0
+  fi
+
+  info "resolving latest cosign release tag..."
+  local latest_version
+  latest_version="$(curl -fsSL https://api.github.com/repos/sigstore/cosign/releases/latest \
+    | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')"
+  if [[ -z "$latest_version" ]]; then
+    err "could not parse cosign tag_name from GitHub API"
+    return 1
+  fi
+
+  local arch
+  case "$(dpkg --print-architecture)" in
+    amd64) arch=amd64 ;;
+    arm64) arch=arm64 ;;
+    *)     err "unsupported arch: $(dpkg --print-architecture)"; return 1 ;;
+  esac
+
+  local tmpdir deb url
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  deb="cosign_${latest_version}_${arch}.deb"
+  url="https://github.com/sigstore/cosign/releases/download/v${latest_version}/${deb}"
+
+  info "installing cosign ${latest_version} (${arch})..."
+  quiet cosign-download curl -fsSL -o "$tmpdir/$deb" "$url"
+  quiet cosign-install  $SUDO dpkg -i "$tmpdir/$deb"
+  ok "cosign ${latest_version} installed"
   return 0
 }
 
@@ -371,6 +419,68 @@ phase_flyctl() {
   quiet flyctl bash -c 'curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive'
   export PATH="$HOME/.fly/bin:$PATH"
   ok "flyctl installed"
+  return 0
+}
+
+phase_sprite_cli() {
+  if [[ $FORCE -ne 1 ]] && command -v sprite >/dev/null 2>&1; then
+    skip "sprite CLI already installed at $(command -v sprite)"
+    return 0
+  fi
+  info "installing sprite CLI..."
+  quiet sprite-cli bash -c 'curl -fsSL https://sprites.dev/install.sh | sh'
+  export PATH="$HOME/.local/bin:$PATH"
+  ok "sprite CLI installed"
+  return 0
+}
+
+phase_claude_upgrade() {
+  if ! command -v claude >/dev/null 2>&1; then
+    warn "claude CLI not found on sprite base image; skipping"
+    return 0
+  fi
+  info "upgrading claude CLI..."
+  if quiet claude-upgrade claude upgrade; then
+    ok "claude upgraded ($(claude --version 2>&1 | head -1))"
+  else
+    err "claude upgrade failed (see $PHASE_LOG_DIR/claude-upgrade.log)"
+    return 1
+  fi
+  return 0
+}
+
+phase_claude_settings() {
+  local settings_dir="$HOME/.claude"
+  local settings_file="$settings_dir/settings.json"
+  mkdir -p "$settings_dir"
+
+  if [[ -f "$settings_file" && $FORCE -ne 1 ]]; then
+    local current
+    current="$(python3 -c 'import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get("tui",""))
+except Exception:
+    print("")' "$settings_file" 2>/dev/null || echo "")"
+    if [[ "$current" == "fullscreen" ]]; then
+      skip "$settings_file already has tui=fullscreen"
+      return 0
+    fi
+  fi
+
+  python3 - "$settings_file" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+data = {}
+if p.exists() and p.read_text().strip():
+    try:
+        data = json.loads(p.read_text())
+    except json.JSONDecodeError:
+        data = {}
+data["tui"] = "fullscreen"
+p.write_text(json.dumps(data, indent=2) + "\n")
+PY
+  chmod 644 "$settings_file"
+  ok "set tui=fullscreen in $settings_file"
   return 0
 }
 
@@ -566,6 +676,44 @@ phase_git_signing() {
   return 0
 }
 
+phase_clone_repos() {
+  local repos_dir="$HOME/repos"
+  mkdir -p "$repos_dir"
+
+  local repos=(
+    "justanotherspy/garlic"
+    "justanotherspy/poker"
+    "justanotherspy/sprite"
+    "justanotherspy/justanotherspy.com"
+  )
+
+  local cloned=0 already=0 failed=0
+  for repo in "${repos[@]}"; do
+    local name="${repo#*/}"
+    local dest="$repos_dir/$name"
+    if [[ -d "$dest/.git" && $FORCE -ne 1 ]]; then
+      already=$((already + 1))
+      continue
+    fi
+    info "cloning $repo -> $dest"
+    if quiet "clone-$name" git clone "git@github.com:${repo}.git" "$dest"; then
+      cloned=$((cloned + 1))
+    else
+      err "failed to clone $repo (continuing)"
+      failed=$((failed + 1))
+    fi
+  done
+
+  if [[ $cloned -gt 0 ]]; then
+    ok "cloned $cloned repo(s); $already already present; $failed failed"
+  elif [[ $already -eq ${#repos[@]} ]]; then
+    skip "all ${#repos[@]} repos already present in $repos_dir"
+  fi
+
+  [[ $failed -gt 0 ]] && return 1
+  return 0
+}
+
 phase_rc_additions() {
   RC_BLOCK=$(cat <<'EOF'
 
@@ -669,21 +817,27 @@ EOF
 # ============================================================================
 START_TIME=$(date +%s)
 
-run_phase apt_core         phase_apt_core
-run_phase corepack         phase_corepack
-run_phase uv               phase_uv
-run_phase semgrep          phase_semgrep
-run_phase trufflehog       phase_trufflehog
-run_phase docker           phase_docker
-run_phase dockerd_service  phase_dockerd_service
-run_phase flyctl           phase_flyctl
-run_phase ssh_known_hosts  phase_ssh_known_hosts
-run_phase git_identity     phase_git_identity
-run_phase ssh_key          phase_ssh_key
-run_phase gh_auth          phase_gh_auth
-run_phase gh_upload_keys   phase_gh_upload_keys
-run_phase git_signing      phase_git_signing
-run_phase rc_additions     phase_rc_additions
+run_phase apt_core          phase_apt_core
+run_phase corepack          phase_corepack
+run_phase uv                phase_uv
+run_phase semgrep           phase_semgrep
+run_phase garlic            phase_garlic
+run_phase trufflehog        phase_trufflehog
+run_phase cosign            phase_cosign
+run_phase docker            phase_docker
+run_phase dockerd_service   phase_dockerd_service
+run_phase flyctl            phase_flyctl
+run_phase sprite_cli        phase_sprite_cli
+run_phase claude_upgrade    phase_claude_upgrade
+run_phase claude_settings   phase_claude_settings
+run_phase ssh_known_hosts   phase_ssh_known_hosts
+run_phase git_identity      phase_git_identity
+run_phase ssh_key           phase_ssh_key
+run_phase gh_auth           phase_gh_auth
+run_phase gh_upload_keys    phase_gh_upload_keys
+run_phase git_signing       phase_git_signing
+run_phase clone_repos       phase_clone_repos
+run_phase rc_additions      phase_rc_additions
 
 ELAPSED=$(( $(date +%s) - START_TIME ))
 echo
