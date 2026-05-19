@@ -181,5 +181,15 @@ output and for forensics after a failed run.
 
 ## History
 
-* **Wave A** (initial bootstrap): apt core, corepack, uv, semgrep, trufflehog, cosign, docker, dockerd service, flyctl, claude upgrade, claude settings, ssh setup, github auth, signing, repo clones, rc additions, verify. Two bugs surfaced in testing: `tldr` was not in questing's apt, and `set -e` was suppressed inside phases (see above). Both fixed in Wave B.
-* **Wave B** (this commit): added `node_lts`, `go_toolchain` (no-op by design), `rust_toolchain`, `black`, `garlic`, `pre_commit`, `ruff`, `dive`, `gitleaks`, `hadolint`, `pre_commit_template`, `gitignore_global`, `garlic_defaults`, `ps1`, `zsh_completions`. Added bracket phases (`pre_checkpoint`, `post_checkpoint`). Added state file and `--status` flag. Fixed the Wave A bugs structurally (`tldr` swapped to `tealdeer`, explicit `|| return 1` on every critical `quiet`).
+* **Wave A**: apt core, corepack, uv, semgrep, trufflehog, cosign, docker, dockerd service, flyctl, claude upgrade, claude settings, ssh setup, github auth, signing, repo clones, rc additions, verify. Two bugs surfaced in testing: `tldr` was not in questing's apt, and `set -e` was suppressed inside phases (see above). Both fixed in Wave B.
+* **Wave B**: added `node_lts`, `go_toolchain` (no-op by design), `rust_toolchain`, `black`, `garlic`, `pre_commit`, `ruff`, `dive`, `gitleaks`, `hadolint`, `pre_commit_template`, `gitignore_global`, `garlic_defaults`, `ps1`, `zsh_completions`. Added bracket phases (`pre_checkpoint`, `post_checkpoint`). Added state file and `--status` flag. Fixed the Wave A bugs structurally (`tldr` swapped to `tealdeer`, explicit `|| return 1` on every critical `quiet`).
+* * **Wave C**: Removed `phase_node_lts` and `phase_go_toolchain`.
+  The sprite base image reliably ships LTS node and a current go; the verify
+  pass catches drift via `SPRITE_TOOLS`, which is a more honest signal than
+  a phase that pretends to manage a version it doesn't actually manage.
+  Reworked `phase_corepack` to pre-activate pnpm and yarn (avoids the
+  first-use download prompt). Reworked `phase_zsh_completions` to report
+  succeeded/failed tools by name. Dropped `gemini` from `SPRITE_TOOLS`
+  (we don't use it). Extended `version_args_for` for tmux and xclip; bumped
+  the version-harvest timeout from 5s to 10s; filtered node stack frames
+  out of version output as defensive coding.
