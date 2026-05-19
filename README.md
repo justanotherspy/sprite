@@ -6,8 +6,6 @@ systemd). The base sprite image already provides language toolchains and the
 sprite CLI; this repo handles everything else: editor tooling, security
 scanners, container engine, git/ssh identity, shell rc, and a verify pass.
 
-Maintainer: Daniel Schwartz (`justanotherspy`)
-
 ## Quick start
 
 On a fresh sprite, run:
