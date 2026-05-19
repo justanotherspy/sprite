@@ -50,15 +50,6 @@ This repo ships a `.mcp.json` that wires up the [sprites.dev MCP server](https:/
 claude mcp add --transport http sprites https://sprites.dev/mcp
 ```
 
-## Claude Code skills
-
-Three skills are included under `.claude/skills/` for common workflows:
-
-| Skill | What it does |
-|---|---|
-| `/pre-check` | Runs `pre.sh` and summarises the baseline state |
-| `/setup` | Guides through running `setup.sh` on the current sprite |
-| `/post-check` | Runs `post.sh` and highlights any failures |
 
 ## Notes
 
