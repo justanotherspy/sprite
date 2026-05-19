@@ -629,7 +629,8 @@ alias dprune='docker system prune -af --volumes'
 
 # tmux
 alias t='tmux attach || tmux new'
-# <<< dev-env-setup shell additions <
+# <<< dev-env-setup shell additions <<<
+
 EOF
 )
 
