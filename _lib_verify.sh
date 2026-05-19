@@ -95,6 +95,8 @@ kv() { printf "%-32s : %s\n" "$1" "$2"; }
 version_args_for() {
   case "$1" in
     cosign|gitleaks|go) printf 'version' ;;
+    tmux)               printf '%s' '-V' ;;
+    xclip)              printf '%s' '-version' ;;
     *)                  printf '%s' '--version' ;;
   esac
 }
@@ -242,7 +244,7 @@ SETUP_TOOLS=(
 # itself drifted, not setup.sh).
 SPRITE_TOOLS=(
   gh node npm bun deno python3 pip go ruby rustc cargo elixir java
-  claude gemini codex
+  claude
   sprite sprite-env
 )
 
@@ -252,12 +254,14 @@ check_tool() {
     local p v ver_args
     p="$(command -v "$cmd")"
     ver_args="$(version_args_for "$cmd")"
-    # 5s timeout: semgrep is famously slow to print --version (Python import storm).
-    # grep -m1 '[0-9]': picks the first line containing a digit, which reliably
-    # skips ASCII-art banners (cosign) and empty lines while finding the real
-    # version line ("trufflehog 3.95.3" / "GitVersion: 3.0.6" / etc).
+    # 10s timeout: semgrep's Python import path can exceed 5s on first run.
+    # Filter lines that look like node stack frames so a broken JS tool can't
+    # corrupt the version column. grep -m1 '[0-9]' then picks the first real
+    # version line (skips banners, blank lines, etc).
     # shellcheck disable=SC2086  # ver_args is a single word; intentional split
-    v="$(timeout 5 "$cmd" $ver_args </dev/null 2>&1 | grep -m1 -E '[0-9]' || true)"
+    v="$(timeout 10 "$cmd" $ver_args </dev/null 2>&1 \
+      | grep -vE '^\s+at\s|\(node:[0-9]+:' \
+      | grep -m1 -E '[0-9]' || true)"
     [[ -z "$v" ]] && v="(version unavailable)"
     ok "$(printf '%-12s %-45s %s' "$cmd" "$p" "$v")"
     return
