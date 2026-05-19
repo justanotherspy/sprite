@@ -336,24 +336,61 @@ verify_tool_versions() {
     fi
   done
 
-  sub "claude settings"
-  if [[ -f "$HOME/.claude/settings.json" ]]; then
-    local tui
-    tui="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("tui",""))' \
-            "$HOME/.claude/settings.json" 2>/dev/null || echo "")"
-    if [[ "$tui" == "fullscreen" ]]; then
-      ok "~/.claude/settings.json has tui=fullscreen"
-    else
-      record_fail "~/.claude/settings.json missing or wrong tui value" "$(
-        kv "expected" "fullscreen"
-        kv "actual"   "${tui:-(unset)}"
+  sub "claude settings + statusline"
+  local cfg="$HOME/.claude/settings.json"
+  local sl="$HOME/.claude/statusline.py"
+  local expected_cmd="python3 $HOME/.claude/statusline.py"
+
+  if [[ -f "$cfg" ]]; then
+    # Each pair is "jq-path|expected" so the loop stays generic.
+    local pair path expected actual mismatches=()
+    for pair in \
+      '.tui|fullscreen' \
+      '.theme|dark' \
+      '.skipDangerousModePermissionPrompt|true' \
+      '.permissions.defaultMode|bypassPermissions' \
+      '.statusLine.type|command' \
+      ".statusLine.command|$expected_cmd" \
+    ; do
+      path="${pair%%|*}"
+      expected="${pair#*|}"
+      actual="$(jq -r "$path // \"\"" "$cfg" 2>/dev/null)"
+      if [[ "$actual" == "$expected" ]]; then
+        ok "settings.json $path = $expected"
+      else
+        mismatches+=("$path  expected=$expected  actual=${actual:-(unset)}")
+      fi
+    done
+    if [[ ${#mismatches[@]} -gt 0 ]]; then
+      record_fail "settings.json missing or wrong key(s)" "$(
+        local m
+        for m in "${mismatches[@]}"; do printf "  %s\n" "$m"; done
         echo
         echo "Current settings.json:"
-        sed 's/^/  /' "$HOME/.claude/settings.json"
+        sed 's/^/  /' "$cfg"
       )"
     fi
   else
     record_fail "~/.claude/settings.json missing" ""
+  fi
+
+  if [[ -f "$sl" ]]; then
+    local mode
+    mode="$(stat -c '%a' "$sl")"
+    if [[ "$mode" == "755" ]]; then
+      ok "$sl mode=755"
+    else
+      record_fail "$sl wrong mode: $mode (expected 755)" ""
+    fi
+    if python3 -c "import py_compile; py_compile.compile('$sl', doraise=True)" >/dev/null 2>&1; then
+      ok "$sl parses as Python"
+    else
+      record_fail "$sl does not parse as Python" "$(
+        python3 -c "import py_compile; py_compile.compile('$sl', doraise=True)" 2>&1 | sed 's/^/  /'
+      )"
+    fi
+  else
+    record_fail "$sl missing" ""
   fi
 
   sub "cloned repos in ~/repos"
