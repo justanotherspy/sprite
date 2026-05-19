@@ -13,14 +13,7 @@ Bootstrap and verification scripts for [sprites.dev](https://sprites.dev) — st
 ## Quick start
 
 ```bash
-# 1. Inspect the fresh sprite (optional but recommended)
-chmod +x pre.sh && ./pre.sh | tee pre-check.txt
-
-# 2. Bootstrap the environment
-chmod +x setup.sh && ./setup.sh
-
-# 3. Verify everything installed correctly
-chmod +x post.sh && ./post.sh | tee post-check.txt
+curl -fsSL https://raw.githubusercontent.com/justanotherspy/sprite/main/setup.sh | bash
 ```
 
 ## What `setup.sh` installs
