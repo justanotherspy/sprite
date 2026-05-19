@@ -44,7 +44,7 @@ container engine, identity, GitHub, repos, shell rc, and finally verify.
 
 ```
 apt_core
-corepack node_lts go_toolchain rust_toolchain
+corepack rust_toolchain
 uv black garlic pre_commit ruff semgrep
 cosign trufflehog dive gitleaks hadolint
 docker dockerd_service flyctl
@@ -73,8 +73,6 @@ the `--comment` label is how you find the right one in
 |-------|--------------------------------|
 | `apt_core` | All `apt` packages we depend on, plus `bat -> batcat` and `fd -> fdfind` symlinks in `~/.local/bin/`. Uses `tealdeer` for the `tldr` command (the older `tldr` apt package is not in questing). |
 | `corepack` | Enables corepack and shims `pnpm` + `yarn` into `~/.local/bin`. |
-| `node_lts` | Sources sprite's nvm, runs `nvm install --lts` only if not already on the LTS major (currently 22.x). |
-| `go_toolchain` | Trusts the sprite-provided `go` and skips by design. Listed for visibility in `--status`. |
 | `rust_toolchain` | Pins `stable` as default, ensures `clippy`, `rustfmt`, `rust-analyzer` are installed. |
 | `uv` | Installs Astral's `uv`. |
 | `black`, `garlic`, `pre_commit`, `ruff`, `semgrep` | All installed via `uv tool install <pkg>`. |
@@ -186,5 +184,15 @@ phase continues.
 
 This is what bit Wave A: `tldr` was not in questing's apt, `apt-get install`
 returned 100, but the phase still hit `ok "installed ..."` and reported
+
+## Gotchas
+
+* `gh auth login` prints `! Authentication credentials saved in plain text`
+  on every run. This is gh's standard warning when no system credential
+  helper is configured. On a sprite there is no credential helper, and
+  there is no flag to suppress the warning. The token still lives under
+  `~/.config/gh/hosts.yml` with mode 600, and `phase_rc_additions` never
+  writes the token into rc files (it's derived live via `gh auth token` at
+  shell startup). Ignore the warning.
 success. The `tldr -> tealdeer` swap is one fix; the explicit `|| return 1`
 pattern across every quiet call is the structural fix.
