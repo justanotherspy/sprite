@@ -464,30 +464,20 @@ phase_claude_settings() {
   mkdir -p "$settings_dir"
 
   if [[ -f "$settings_file" && $FORCE -ne 1 ]]; then
-    local current
-    current="$(python3 -c 'import json,sys
-try:
-    print(json.load(open(sys.argv[1])).get("tui",""))
-except Exception:
-    print("")' "$settings_file" 2>/dev/null || echo "")"
-    if [[ "$current" == "fullscreen" ]]; then
+    if [[ "$(jq -r '.tui // ""' "$settings_file" 2>/dev/null)" == "fullscreen" ]]; then
       skip "$settings_file already has tui=fullscreen"
       return 0
     fi
   fi
 
-  python3 - "$settings_file" <<'PY'
-import json, pathlib, sys
-p = pathlib.Path(sys.argv[1])
-data = {}
-if p.exists() and p.read_text().strip():
-    try:
-        data = json.loads(p.read_text())
-    except json.JSONDecodeError:
-        data = {}
-data["tui"] = "fullscreen"
-p.write_text(json.dumps(data, indent=2) + "\n")
-PY
+  local tmp
+  tmp="$(mktemp)"
+  if [[ -f "$settings_file" && -s "$settings_file" ]]; then
+    jq '. + {tui: "fullscreen"}' "$settings_file" > "$tmp"
+  else
+    printf '{"tui":"fullscreen"}\n' | jq . > "$tmp"
+  fi
+  mv "$tmp" "$settings_file"
   chmod 644 "$settings_file"
   ok "set tui=fullscreen in $settings_file"
   return 0
