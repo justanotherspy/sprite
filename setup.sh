@@ -40,14 +40,13 @@ log()  { printf "\n%s%s==>%s %s\n" "$BLUE" "$BOLD" "$RESET" "$*"; }
 info() { printf "    %s\n" "$*"; }
 warn() { printf "%s!%s %s\n" "$YELLOW" "$RESET" "$*"; }
 err()  { printf "%sx%s %s\n" "$RED" "$RESET" "$*" >&2; }
-# `ok` now also marks the current phase as having done real work.
+# `ok` also marks the current phase as having done real work.
 ok() {
   PHASE_DID_WORK=1
   printf "%s+%s %s\n" "$GREEN" "$RESET" "$*"
 }
-# Like ok() but for verifications/passive checks — does NOT mark the phase
-# as having done work. Use when the phase only confirmed something, not
-# changed something.
+# Like ok() but for verifications/passive checks; does NOT mark the phase
+# as having done work. Use when the phase only confirmed something.
 note() {
   printf "%s+%s %s\n" "$GREEN" "$RESET" "$*"
 }
@@ -113,12 +112,13 @@ FORCE=0
 ONLY_PHASE=""
 PHASES=(
   apt_core corepack uv semgrep garlic cosign trufflehog
-  docker dockerd_service flyctl sprite_cli
+  docker dockerd_service flyctl
   claude_upgrade claude_settings
   ssh_known_hosts git_identity ssh_key
   gh_auth gh_upload_keys git_signing
   clone_repos
   rc_additions
+  verify
 )
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -197,10 +197,14 @@ export PATH="$HOME/.local/bin:$HOME/.fly/bin:$PATH"
 # ============================================================================
 
 phase_apt_core() {
+  # Wave A additions: tmux, tldr, hyperfine, zoxide.
+  # gitleaks is intentionally NOT here; it's not packaged in Ubuntu's archive,
+  # ships as a Go binary from GitHub releases. It will land in Wave B as a
+  # binary-install phase modelled on phase_cosign.
   local needed=(
     apt-transport-https software-properties-common lsb-release
-    shellcheck bat btop direnv fd-find fzf jq mosh ncdu neovim
-    netcat-openbsd ripgrep traceroute yq xclip
+    shellcheck bat btop direnv fd-find fzf hyperfine jq mosh ncdu neovim
+    netcat-openbsd ripgrep tldr tmux traceroute yq zoxide xclip
   )
   local missing=()
   for pkg in "${needed[@]}"; do
@@ -282,24 +286,6 @@ phase_garlic() {
   return 0
 }
 
-phase_trufflehog() {
-  if [[ $FORCE -ne 1 ]] && command -v trufflehog >/dev/null 2>&1; then
-    skip "trufflehog already installed"
-    return 0
-  fi
-  if ! command -v cosign >/dev/null 2>&1; then
-    err "cosign must be installed before trufflehog (-v requires it for signature verification)"
-    err "run: ./setup.sh --only cosign"
-    return 1
-  fi
-  info "installing trufflehog (with cosign signature verification)..."
-  quiet trufflehog bash -c \
-    'curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-       | '"$SUDO"' sh -s -- -v -b /usr/local/bin'
-  ok "trufflehog installed"
-  return 0
-}
-
 phase_cosign() {
   if [[ $FORCE -ne 1 ]] && command -v cosign >/dev/null 2>&1; then
     skip "cosign already installed ($(cosign version --short 2>&1 | head -1))"
@@ -335,6 +321,24 @@ phase_cosign() {
   quiet cosign-download curl -fsSL -o "$tmpdir/$deb" "$url"
   quiet cosign-install  $SUDO dpkg -i "$tmpdir/$deb"
   ok "cosign ${latest_version} installed"
+  return 0
+}
+
+phase_trufflehog() {
+  if [[ $FORCE -ne 1 ]] && command -v trufflehog >/dev/null 2>&1; then
+    skip "trufflehog already installed"
+    return 0
+  fi
+  if ! command -v cosign >/dev/null 2>&1; then
+    err "cosign must be installed before trufflehog (-v requires it for signature verification)"
+    err "run: ./setup.sh --only cosign"
+    return 1
+  fi
+  info "installing trufflehog (with cosign signature verification)..."
+  quiet trufflehog bash -c \
+    'curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+       | '"$SUDO"' sh -s -- -v -b /usr/local/bin'
+  ok "trufflehog installed"
   return 0
 }
 
@@ -428,18 +432,6 @@ phase_flyctl() {
   quiet flyctl bash -c 'curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive'
   export PATH="$HOME/.fly/bin:$PATH"
   ok "flyctl installed"
-  return 0
-}
-
-phase_sprite_cli() {
-  if [[ $FORCE -ne 1 ]] && command -v sprite >/dev/null 2>&1; then
-    skip "sprite CLI already installed at $(command -v sprite)"
-    return 0
-  fi
-  info "installing sprite CLI..."
-  quiet sprite-cli bash -c 'curl -fsSL https://sprites.dev/install.sh | sh'
-  export PATH="$HOME/.local/bin:$PATH"
-  ok "sprite CLI installed"
   return 0
 }
 
@@ -568,7 +560,6 @@ phase_gh_auth() {
   if [[ $FORCE -ne 1 ]] && gh auth status -h github.com >/dev/null 2>&1; then
     local who; who="$(gh api user --jq .login 2>/dev/null || echo unknown)"
     if [[ "$who" == "$GH_USERNAME" ]]; then
-      # Check existing token actually has the scopes we need.
       local status_out; status_out="$(gh auth status -h github.com 2>&1)"
       if echo "$status_out" | grep -q "admin:public_key" \
          && echo "$status_out" | grep -q "admin:ssh_signing_key"; then
@@ -614,8 +605,7 @@ phase_gh_upload_keys() {
   local title_sign="sprite-${HOSTNAME}-signing"
 
   # Use gh api directly so we get clean JSON instead of human-formatted output
-  # that may leak across stdout/stderr. Requires admin:public_key /
-  # admin:ssh_signing_key (granted by phase_gh_auth).
+  # that may leak across stdout/stderr.
   local existing_auth existing_sign
   existing_auth="$(gh api user/keys --jq '.[].title' 2>/dev/null || true)"
   existing_sign="$(gh api user/ssh_signing_keys --jq '.[].title' 2>/dev/null || true)"
@@ -634,8 +624,7 @@ phase_gh_upload_keys() {
     ok "uploaded signing key '$title_sign'"
   fi
 
-  # GitHub takes a moment to propagate newly uploaded keys to the SSH layer.
-  # Some runs need >30s. Retry with backoff and capture the last error.
+  # GitHub can take >30s to propagate freshly uploaded keys. Retry with backoff.
   local last_output="" total=0 wait=3
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     last_output="$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
@@ -737,6 +726,15 @@ if command -v direnv >/dev/null 2>&1; then
   fi
 fi
 
+# zoxide: smart cd
+if command -v zoxide >/dev/null 2>&1; then
+  if [ -n "$BASH_VERSION" ]; then
+    eval "$(zoxide init bash)"
+  elif [ -n "$ZSH_VERSION" ]; then
+    eval "$(zoxide init zsh)"
+  fi
+fi
+
 # fzf keybindings (if present)
 [ -f /usr/share/doc/fzf/examples/key-bindings.bash ] && [ -n "$BASH_VERSION" ] && \
   source /usr/share/doc/fzf/examples/key-bindings.bash
@@ -777,7 +775,6 @@ alias dprune='docker system prune -af --volumes'
 # tmux
 alias t='tmux attach || tmux new'
 # <<< dev-env-setup shell additions <<<
-
 EOF
 )
 
@@ -812,6 +809,67 @@ EOF
 }
 
 # ============================================================================
+# phase_verify
+# Runs the post-install verification suite inline at the end of setup.sh.
+# Sources _lib_verify.sh inside a subshell so the lib's helper definitions
+# don't shadow setup.sh's helpers (log/ok/warn/note/skip behave differently
+# in the lib: they track PASS/FAIL/WARN counters).
+#
+# This is the same logic post.sh uses as a standalone script. If verify
+# reports failures, this phase fails (rc=1); earlier phases are unaffected.
+# ============================================================================
+phase_verify() {
+  # Resolve the lib path. Prefer same-dir lookup. Fall back to a curl-mode
+  # download when setup.sh was invoked via `bash <(curl ...)` (in which case
+  # $0 is a /dev/fd path, not a real file).
+  local script_path script_dir lib
+  script_path="${BASH_SOURCE[0]:-$0}"
+  script_dir="$(cd "$(dirname "$script_path" 2>/dev/null)" 2>/dev/null && pwd || echo "")"
+  lib="$script_dir/_lib_verify.sh"
+
+  local cleanup_lib=""
+  if [[ ! -f "$lib" ]]; then
+    info "_lib_verify.sh not found locally; fetching for inline verify"
+    lib="$(mktemp -t _lib_verify.XXXXXX.sh)"
+    cleanup_lib="$lib"
+    if ! curl -fsSL \
+         "https://raw.githubusercontent.com/justanotherspy/sprite/main/_lib_verify.sh" \
+         -o "$lib"; then
+      err "could not fetch _lib_verify.sh; skipping inline verification"
+      rm -f "$cleanup_lib"
+      return 1
+    fi
+  fi
+
+  info "running inline post-install verification (same checks as post.sh)"
+
+  # Run the verify pass in a subshell so the lib's helper definitions
+  # (log, ok, warn, note, skip, record_fail, etc.) don't leak into the
+  # rest of setup.sh. The subshell's exit code IS the verify result.
+  set +e
+  (
+    set +e
+    # Pass identity through so the lib can validate user.name etc.
+    export GIT_USER_NAME GIT_USER_EMAIL GIT_DEFAULT_BRANCH GH_USERNAME
+    # shellcheck disable=SC1090
+    source "$lib"
+    verify_run_all
+    verify_print_summary
+  )
+  local verify_rc=$?
+  set -e
+
+  [[ -n "$cleanup_lib" ]] && rm -f "$cleanup_lib"
+
+  if [[ $verify_rc -ne 0 ]]; then
+    err "post-install verification reported failures (see above)"
+    return 1
+  fi
+  ok "post-install verification passed"
+  return 0
+}
+
+# ============================================================================
 # Run
 # ============================================================================
 START_TIME=$(date +%s)
@@ -826,7 +884,6 @@ run_phase trufflehog        phase_trufflehog
 run_phase docker            phase_docker
 run_phase dockerd_service   phase_dockerd_service
 run_phase flyctl            phase_flyctl
-run_phase sprite_cli        phase_sprite_cli
 run_phase claude_upgrade    phase_claude_upgrade
 run_phase claude_settings   phase_claude_settings
 run_phase ssh_known_hosts   phase_ssh_known_hosts
@@ -837,6 +894,7 @@ run_phase gh_upload_keys    phase_gh_upload_keys
 run_phase git_signing       phase_git_signing
 run_phase clone_repos       phase_clone_repos
 run_phase rc_additions      phase_rc_additions
+run_phase verify            phase_verify
 
 ELAPSED=$(( $(date +%s) - START_TIME ))
 echo
@@ -853,7 +911,6 @@ detect_invoking_shell() {
   case "$parent" in
     zsh|bash|fish) echo "$parent"; return ;;
   esac
-  # Fall back to $SHELL if /proc lookup failed
   basename "${SHELL:-bash}"
 }
 
@@ -867,5 +924,5 @@ esac
 info "1. Open a new shell or run: source $RC_FILE"
 info "2. For docker without sudo: log out/in, or run 'newgrp docker'"
 info "3. Per-phase logs (if you want to inspect): $PHASE_LOG_DIR/"
-info "4. Verify with: ./post.sh"
+info "4. Re-run verify standalone with: ./post.sh"
 echo
