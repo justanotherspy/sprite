@@ -45,6 +45,12 @@ ok() {
   PHASE_DID_WORK=1
   printf "%s+%s %s\n" "$GREEN" "$RESET" "$*"
 }
+# Like ok() but for verifications/passive checks — does NOT mark the phase
+# as having done work. Use when the phase only confirmed something, not
+# changed something.
+note() {
+  printf "%s+%s %s\n" "$GREEN" "$RESET" "$*"
+}
 skip() { printf "%s-%s %s%s%s\n" "$GREY" "$RESET" "$GREY" "$*" "$RESET"; }
 
 # ============================================================================
@@ -527,7 +533,7 @@ phase_gh_upload_keys() {
     last_output="$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
                        -T git@github.com 2>&1)"
     if echo "$last_output" | grep -q "successfully authenticated"; then
-      ok "github SSH auth verified (attempt $attempt, ${total}s)"
+      note "github SSH auth verified (attempt $attempt, ${total}s)"
       return 0
     fi
     sleep "$wait"
@@ -569,7 +575,6 @@ export PATH="$HOME/.local/bin:$PATH"
 [ -d "$HOME/.fly/bin" ] && export PATH="$HOME/.fly/bin:$PATH"
 
 # GH_TOKEN/GITHUB_TOKEN derived live from gh's secure store.
-# No plaintext token on disk; rotation in gh just works.
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   export GH_TOKEN="$(gh auth token 2>/dev/null)"
   export GITHUB_TOKEN="$GH_TOKEN"
@@ -625,9 +630,28 @@ alias t='tmux attach || tmux new'
 # <<< dev-env-setup shell additions <
 EOF
 )
+
+  # Strip the leading newline from the heredoc so we can compare cleanly
+  # against what sed extracts (which has no leading newline).
+  local expected="${RC_BLOCK#$'\n'}"
+
+  local needs_write=0
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    if [[ ! -f "$rc" ]]; then needs_write=1; break; fi
+    # Stale legacy block from older setup versions should always trigger a rewrite
+    if grep -q '# >>> dev-env-setup GH_TOKEN >>>' "$rc"; then needs_write=1; break; fi
+    local current
+    current="$(sed -n '/# >>> dev-env-setup shell additions >>>/,/# <<< dev-env-setup shell additions <<</p' "$rc")"
+    if [[ "$current" != "$expected" ]]; then needs_write=1; break; fi
+  done
+
+  if [[ $needs_write -eq 0 && $FORCE -ne 1 ]]; then
+    skip "rc additions already current in .bashrc and .zshrc"
+    return 0
+  fi
+
   for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
     touch "$rc"
-    # Strip both the current block and the legacy GH_TOKEN block from older runs.
     sed -i '/# >>> dev-env-setup shell additions >>>/,/# <<< dev-env-setup shell additions <<</d' "$rc"
     sed -i '/# >>> dev-env-setup GH_TOKEN >>>/,/# <<< dev-env-setup GH_TOKEN <<</d' "$rc"
     printf "%s\n" "$RC_BLOCK" >> "$rc"
