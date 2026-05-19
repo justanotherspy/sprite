@@ -17,7 +17,7 @@ Non-destructive snapshot of the sprite before any changes. Captures OS info, pre
 
 ### `setup.sh`
 Idempotent bootstrap that installs and configures:
-- **APT packages**: shellcheck, bat, btop, direnv, fd-find, fzf, mosh, ncdu, neovim, netcat-openbsd, ripgrep, traceroute, yq
+- **APT packages**: shellcheck, bat, btop, direnv, fd-find, fzf, jq, mosh, ncdu, neovim, netcat-openbsd, ripgrep, traceroute, yq, xclip
 - **uv** (Astral Python toolchain manager)
 - **semgrep** (via `uv tool install`)
 - **trufflehog** (secrets scanner)
