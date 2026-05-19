@@ -224,12 +224,18 @@ phase_corepack() {
     return 0
   fi
   if [[ $FORCE -ne 1 ]] && command -v pnpm >/dev/null 2>&1 && command -v yarn >/dev/null 2>&1; then
-    skip "pnpm and yarn already shimmed"
+    skip "pnpm and yarn already shimmed at $(dirname "$(command -v pnpm)")"
     return 0
   fi
-  info "enabling corepack (pnpm + yarn shims)..."
-  quiet corepack corepack enable || warn "corepack enable failed (non-fatal)"
-  ok "corepack enabled"
+  info "enabling corepack (pnpm + yarn shims into ~/.local/bin)..."
+  mkdir -p "$HOME/.local/bin"
+  quiet corepack corepack enable --install-directory "$HOME/.local/bin" \
+    || warn "corepack enable failed (non-fatal)"
+  if command -v pnpm >/dev/null 2>&1 && command -v yarn >/dev/null 2>&1; then
+    ok "corepack enabled (pnpm + yarn on PATH)"
+  else
+    warn "corepack enable returned 0 but shims still missing; check $PHASE_LOG_DIR/corepack.log"
+  fi
   return 0
 }
 
@@ -514,19 +520,23 @@ phase_gh_upload_keys() {
     ok "uploaded signing key '$title_sign'"
   fi
 
-  # GitHub needs a moment to propagate newly uploaded keys to the SSH layer.
-  # Retry a handful of times before giving up.
-  local tries=0 max=6
-  while (( tries < max )); do
-    if ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
-           -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
-      ok "github SSH auth verified (attempt $((tries+1)))"
+  # GitHub takes a moment to propagate newly uploaded keys to the SSH layer.
+  # Some runs need >30s. Retry with backoff and capture the last error.
+  local last_output="" total=0 wait=3
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    last_output="$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+                       -T git@github.com 2>&1)"
+    if echo "$last_output" | grep -q "successfully authenticated"; then
+      ok "github SSH auth verified (attempt $attempt, ${total}s)"
       return 0
     fi
-    tries=$((tries+1))
-    sleep 2
+    sleep "$wait"
+    total=$((total + wait))
+    (( attempt >= 4 )) && wait=5
   done
-  warn "github SSH auth not verified after $max attempts (retry: ssh -T git@github.com)"
+  warn "github SSH auth not verified after ${total}s; last ssh output:"
+  echo "$last_output" | sed 's/^/    /' >&2
+  warn "retry manually: ssh -T git@github.com"
   return 0
 }
 
