@@ -580,12 +580,15 @@ if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   export GITHUB_TOKEN="$GH_TOKEN"
 fi
 
-# direnv (auto-detect current shell)
+# direnv: detect the actual interpreter via BASH_VERSION / ZSH_VERSION,
+# not $SHELL (which sticks around as your login shell even when newgrp,
+# sudo -s, or a script-invoked bash gives you a different interpreter).
 if command -v direnv >/dev/null 2>&1; then
-  case "$(basename "${SHELL:-bash}")" in
-    bash) eval "$(direnv hook bash)" ;;
-    zsh)  eval "$(direnv hook zsh)"  ;;
-  esac
+  if [ -n "$BASH_VERSION" ]; then
+    eval "$(direnv hook bash)"
+  elif [ -n "$ZSH_VERSION" ]; then
+    eval "$(direnv hook zsh)"
+  fi
 fi
 
 # fzf keybindings (if present)
