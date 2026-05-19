@@ -171,7 +171,7 @@ log "Tool versions"
 
 # Binaries setup.sh is responsible for. Missing here = critical fail.
 SETUP_TOOLS=(
-  shellcheck bat fd rg fzf ncdu mosh nvim btop direnv yq traceroute xclip
+  shellcheck bat fd rg fzf jq ncdu mosh nvim btop direnv yq traceroute xclip
   uv uvx semgrep trufflehog cosign garlic
   docker
   flyctl sprite
