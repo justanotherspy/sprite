@@ -142,8 +142,13 @@ phase_apt_core() {
 
   # Ubuntu renames bat -> batcat, fd -> fdfind. Provide the canonical names.
   mkdir -p "$HOME/.local/bin"
-  [[ -x /usr/bin/batcat && ! -e "$HOME/.local/bin/bat" ]] && ln -s /usr/bin/batcat "$HOME/.local/bin/bat"
-  [[ -x /usr/bin/fdfind && ! -e "$HOME/.local/bin/fd"  ]] && ln -s /usr/bin/fdfind  "$HOME/.local/bin/fd"
+  if [[ -x /usr/bin/batcat && ! -e "$HOME/.local/bin/bat" ]]; then
+    ln -s /usr/bin/batcat "$HOME/.local/bin/bat"
+  fi
+  if [[ -x /usr/bin/fdfind && ! -e "$HOME/.local/bin/fd" ]]; then
+    ln -s /usr/bin/fdfind "$HOME/.local/bin/fd"
+  fi
+  return 0
 }
 
 phase_corepack() {
