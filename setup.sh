@@ -348,8 +348,6 @@ phase_dockerd_service() {
   fi
 
   info "registering dockerd Service (boot events stream for ~5s)"
-  # Filter the JSON event stream to lifecycle markers; full stream lands in
-  # /.sprite/logs/services/dockerd.log. PIPESTATUS keeps real failures visible.
   set +o pipefail
   sprite-env services create dockerd --cmd sudo --args "/usr/bin/dockerd" 2>&1 \
     | grep --line-buffered -E '"type":"(started|complete|error)"' \
@@ -360,6 +358,7 @@ phase_dockerd_service() {
     err "sprite-env services create exited with $rc"
     return 1
   fi
+  ok "dockerd Service registered"
   return 0
 }
 
@@ -691,14 +690,26 @@ print_summary
 echo
 log "All done (${ELAPSED}s)"
 
-case "$(basename "${SHELL:-bash}")" in
+# Detect the shell that invoked us (more reliable than $SHELL, which is
+# the login shell from /etc/passwd and may not match the user's actual
+# interactive shell).
+detect_invoking_shell() {
+  local parent
+  parent="$(ps -p "$PPID" -o comm= 2>/dev/null | tr -d ' ' | sed 's/^-//')"
+  case "$parent" in
+    zsh|bash|fish) echo "$parent"; return ;;
+  esac
+  # Fall back to $SHELL if /proc lookup failed
+  basename "${SHELL:-bash}"
+}
+
+case "$(detect_invoking_shell)" in
   zsh)  RC_FILE="$HOME/.zshrc"  ;;
   bash) RC_FILE="$HOME/.bashrc" ;;
   fish) RC_FILE="$HOME/.config/fish/config.fish"
         warn "fish detected; rc additions were written to .bashrc/.zshrc only" ;;
   *)    RC_FILE="$HOME/.bashrc" ;;
 esac
-
 info "1. Open a new shell or run: source $RC_FILE"
 info "2. For docker without sudo: log out/in, or run 'newgrp docker'"
 info "3. Per-phase logs (if you want to inspect): $PHASE_LOG_DIR/"
