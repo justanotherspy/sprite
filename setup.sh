@@ -40,8 +40,64 @@ log()  { printf "\n%s%s==>%s %s\n" "$BLUE" "$BOLD" "$RESET" "$*"; }
 info() { printf "    %s\n" "$*"; }
 warn() { printf "%s!%s %s\n" "$YELLOW" "$RESET" "$*"; }
 err()  { printf "%sx%s %s\n" "$RED" "$RESET" "$*" >&2; }
-ok()   { printf "%s+%s %s\n" "$GREEN" "$RESET" "$*"; }
+# `ok` now also marks the current phase as having done real work.
+ok() {
+  PHASE_DID_WORK=1
+  printf "%s+%s %s\n" "$GREEN" "$RESET" "$*"
+}
 skip() { printf "%s-%s %s%s%s\n" "$GREY" "$RESET" "$GREY" "$*" "$RESET"; }
+
+# ============================================================================
+# Per-phase command logs (used by quiet wrapper)
+# ============================================================================
+PHASE_LOG_DIR="${PHASE_LOG_DIR:-/tmp/dev-env-setup-phases}"
+mkdir -p "$PHASE_LOG_DIR"
+
+# quiet <label> <command> [args...]
+# Run a command with stdout+stderr redirected to a per-label log file.
+# Silent on success; on failure prints the last 40 lines and returns
+# the command's exit code.
+quiet() {
+  local label="$1"; shift
+  local log="$PHASE_LOG_DIR/${label}.log"
+  if "$@" >"$log" 2>&1; then
+    return 0
+  fi
+  local rc=$?
+  err "$label failed (rc=$rc); last 40 lines below (full log: $log):"
+  tail -n 40 "$log" 2>/dev/null | sed 's/^/    /' >&2 || true
+  return $rc
+}
+
+print_summary() {
+  log "Summary"
+  if [[ ${#PHASES_RAN[@]} -gt 0 ]]; then
+    printf "    Ran (%d):\n" "${#PHASES_RAN[@]}"
+    for p in "${PHASES_RAN[@]}"; do
+      printf "      %s+%s %s\n" "$GREEN" "$RESET" "$p"
+    done
+  fi
+  if [[ ${#PHASES_SKIPPED[@]} -gt 0 ]]; then
+    printf "    Already done (%d):\n" "${#PHASES_SKIPPED[@]}"
+    for p in "${PHASES_SKIPPED[@]}"; do
+      printf "      %s-%s %s%s%s\n" "$GREY" "$RESET" "$GREY" "$p" "$RESET"
+    done
+  fi
+  if [[ ${#PHASES_FAILED[@]} -gt 0 ]]; then
+    printf "    Failed (%d):\n" "${#PHASES_FAILED[@]}"
+    for p in "${PHASES_FAILED[@]}"; do
+      printf "      %sx%s %s\n" "$RED" "$RESET" "$p"
+    done
+  fi
+}
+
+# ============================================================================
+# Phase-result tracking (drives the end-of-run summary)
+# ============================================================================
+PHASES_RAN=()        # did real work this run
+PHASES_SKIPPED=()    # all idempotency checks passed
+PHASES_FAILED=()     # something blew up
+PHASE_DID_WORK=0     # toggled to 1 by ok() inside a phase
 
 # ============================================================================
 # CLI flags
@@ -77,17 +133,27 @@ HELP
   esac
 done
 
+# `run_phase` reads PHASE_DID_WORK after the function returns to decide
+# which bucket to put the phase in.
 run_phase() {
   local name="$1" fn="$2"
   if [[ -n "$ONLY_PHASE" && "$ONLY_PHASE" != "$name" ]]; then return 0; fi
-  local t0 t1
+  local t0 t1 elapsed
   t0=$(date +%s)
+  PHASE_DID_WORK=0
   log "Phase: $name"
   if "$fn"; then
-    t1=$(date +%s)
-    ok "phase '$name' done ($((t1 - t0))s)"
+    t1=$(date +%s); elapsed=$((t1 - t0))
+    if [[ $PHASE_DID_WORK -eq 1 ]]; then
+      PHASES_RAN+=("$name (${elapsed}s)")
+    else
+      PHASES_SKIPPED+=("$name")
+    fi
+    # raw printf so this trailing OK doesn't also toggle PHASE_DID_WORK
+    printf "%s+%s phase '%s' done (%ss)\n" "$GREEN" "$RESET" "$name" "$elapsed"
   else
     local rc=$?
+    PHASES_FAILED+=("$name (rc=$rc)")
     err "phase '$name' failed (rc=$rc)"
     return $rc
   fi
@@ -135,12 +201,13 @@ phase_apt_core() {
   if [[ ${#missing[@]} -eq 0 && $FORCE -ne 1 ]]; then
     skip "all core packages already present"
   else
-    info "installing: ${missing[*]:-(force, full set)}"
-    $SUDO apt-get update -y
-    $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y "${needed[@]}"
+    info "installing ${#missing[@]} apt package(s)..."
+    quiet apt-update  $SUDO apt-get update -y
+    quiet apt-install $SUDO DEBIAN_FRONTEND=noninteractive \
+                         apt-get install -y "${needed[@]}"
+    ok "installed ${#missing[@]} package(s)"
   fi
 
-  # Ubuntu renames bat -> batcat, fd -> fdfind. Provide the canonical names.
   mkdir -p "$HOME/.local/bin"
   if [[ -x /usr/bin/batcat && ! -e "$HOME/.local/bin/bat" ]]; then
     ln -s /usr/bin/batcat "$HOME/.local/bin/bat"
@@ -160,7 +227,9 @@ phase_corepack() {
     skip "pnpm and yarn already shimmed"
     return 0
   fi
-  corepack enable >/dev/null 2>&1 || warn "corepack enable failed (non-fatal)"
+  info "enabling corepack (pnpm + yarn shims)..."
+  quiet corepack corepack enable || warn "corepack enable failed (non-fatal)"
+  ok "corepack enabled"
   return 0
 }
 
@@ -169,8 +238,10 @@ phase_uv() {
     skip "uv $(uv --version 2>&1 | awk '{print $2}') already installed"
     return 0
   fi
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+  info "installing uv (Astral)..."
+  quiet uv-install bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
   export PATH="$HOME/.local/bin:$PATH"
+  ok "uv installed"
   return 0
 }
 
@@ -179,7 +250,9 @@ phase_semgrep() {
     skip "semgrep already installed"
     return 0
   fi
-  "$HOME/.local/bin/uv" tool install semgrep
+  info "installing semgrep via uv..."
+  quiet semgrep "$HOME/.local/bin/uv" tool install semgrep
+  ok "semgrep installed"
   return 0
 }
 
@@ -188,8 +261,11 @@ phase_trufflehog() {
     skip "trufflehog already installed"
     return 0
   fi
-  curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-    | $SUDO sh -s -- -b /usr/local/bin
+  info "installing trufflehog..."
+  quiet trufflehog bash -c \
+    'curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+       | '"$SUDO"' sh -s -- -b /usr/local/bin'
+  ok "trufflehog installed"
   return 0
 }
 
@@ -199,49 +275,46 @@ phase_docker() {
     return 0
   fi
 
-  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
-    $SUDO apt-get remove -y "$pkg" >/dev/null 2>&1 || true
-  done
-
-  $SUDO install -m 0755 -d /etc/apt/keyrings
-  if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then
-    $SUDO curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-    $SUDO chmod a+r /etc/apt/keyrings/docker.asc
-  fi
-
-  local codename
-  codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
-  if ! curl -fsI "https://download.docker.com/linux/ubuntu/dists/${codename}/Release" >/dev/null 2>&1; then
-    case "$codename" in
-      questing|oracular|plucky)
-        info "Docker has no '$codename' repo (expected for non-LTS); pinning to 'noble'" ;;
-      *)
-        warn "Docker repo has no release for '$codename'; falling back to 'noble'" ;;
-    esac
-    codename="noble"
-  fi
-
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" \
-    | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
-
-  $SUDO apt-get update -y
-  $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    docker-ce docker-ce-cli containerd.io \
-    docker-buildx-plugin docker-compose-plugin
-
-  $SUDO groupadd docker 2>/dev/null || true
-  $SUDO usermod -aG docker "$USER"
-
-  if [[ ! -f /etc/docker/daemon.json ]]; then
-    $SUDO mkdir -p /etc/docker
-    $SUDO tee /etc/docker/daemon.json >/dev/null <<'JSON'
+  info "installing docker engine (apt repo + plugins)..."
+  local log="$PHASE_LOG_DIR/docker.log"
+  if ! {
+    for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
+      $SUDO apt-get remove -y "$pkg" || true
+    done
+    $SUDO install -m 0755 -d /etc/apt/keyrings
+    if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then
+      $SUDO curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      $SUDO chmod a+r /etc/apt/keyrings/docker.asc
+    fi
+    local codename
+    codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
+    if ! curl -fsI "https://download.docker.com/linux/ubuntu/dists/${codename}/Release" >/dev/null 2>&1; then
+      codename="noble"
+    fi
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" \
+      | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+    $SUDO apt-get update -y
+    $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      docker-ce docker-ce-cli containerd.io \
+      docker-buildx-plugin docker-compose-plugin
+    $SUDO groupadd docker 2>/dev/null || true
+    $SUDO usermod -aG docker "$USER"
+    if [[ ! -f /etc/docker/daemon.json ]]; then
+      $SUDO mkdir -p /etc/docker
+      $SUDO tee /etc/docker/daemon.json >/dev/null <<'JSON'
 {
   "log-driver": "json-file",
   "log-opts": { "max-size": "20m", "max-file": "5" },
   "live-restore": true
 }
 JSON
+    fi
+  } >"$log" 2>&1; then
+    err "docker install failed; last 40 lines below (full log: $log):"
+    tail -n 40 "$log" | sed 's/^/    /' >&2 || true
+    return 1
   fi
+  ok "docker installed"
   return 0
 }
 
@@ -283,8 +356,10 @@ phase_flyctl() {
     skip "flyctl already installed"
     return 0
   fi
-  curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive
+  info "installing flyctl..."
+  quiet flyctl bash -c 'curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive'
   export PATH="$HOME/.fly/bin:$PATH"
+  ok "flyctl installed"
   return 0
 }
 
@@ -298,6 +373,7 @@ phase_ssh_known_hosts() {
     return 0
   fi
   ssh-keyscan -t rsa,ecdsa,ed25519 github.com 2>/dev/null >> "$HOME/.ssh/known_hosts"
+  ok "github.com host keys added"
   return 0
 }
 
@@ -360,6 +436,7 @@ phase_ssh_key() {
     -f "$key" -N ""
   eval "$(ssh-agent -s)" >/dev/null
   ssh-add "$key" >/dev/null 2>&1 || true
+  ok "ed25519 key generated"
   return 0
 }
 
@@ -452,6 +529,7 @@ phase_gh_upload_keys() {
   warn "github SSH auth not verified after $max attempts (retry: ssh -T git@github.com)"
   return 0
 }
+
 phase_git_signing() {
   local pub="$HOME/.ssh/id_ed25519.pub"
   local signers="$HOME/.ssh/allowed_signers"
@@ -545,6 +623,7 @@ EOF
     printf "%s\n" "$RC_BLOCK" >> "$rc"
   done
   chmod 644 "$HOME/.bashrc" "$HOME/.zshrc" 2>/dev/null || true
+  ok "rc additions written"
   return 0
 }
 
@@ -570,8 +649,21 @@ run_phase git_signing      phase_git_signing
 run_phase rc_additions     phase_rc_additions
 
 ELAPSED=$(( $(date +%s) - START_TIME ))
+echo
+print_summary
+echo
 log "All done (${ELAPSED}s)"
-info "1. Open a new shell or run: source ~/.bashrc (or ~/.zshrc)"
+
+# Tell the user about their actual shell, not "bash or zsh".
+case "$(basename "${SHELL:-bash}")" in
+  zsh)  RC_FILE="$HOME/.zshrc"  ;;
+  bash) RC_FILE="$HOME/.bashrc" ;;
+  fish) RC_FILE="$HOME/.config/fish/config.fish"
+        warn "fish detected; rc additions were written to .bashrc/.zshrc only" ;;
+  *)    RC_FILE="$HOME/.bashrc" ;;
+esac
+info "1. Open a new shell or run: source $RC_FILE"
 info "2. For docker without sudo: log out/in, or run 'newgrp docker'"
-info "3. Verify with: ./post.sh"
+info "3. Per-phase logs (if you want to inspect): $PHASE_LOG_DIR/"
+info "4. Verify with: ./post.sh"
 echo
