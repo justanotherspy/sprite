@@ -1,0 +1,227 @@
+schema_version: 1
+
+identity:
+  git_user_name: "Daniel Schwartz"
+  git_user_email: "danielschwar@gmail.com"
+  git_default_branch: main
+  gh_username: justanotherspy
+
+env:
+  - from: GH_TOKEN
+    as: GH_TOKEN
+    required: true
+
+phases:
+  # ── System packages ──────────────────────────────────────────────────────────
+  - type: apt
+    packages:
+      - apt-transport-https
+      - software-properties-common
+      - lsb-release
+      - shellcheck
+      - bat
+      - btop
+      - direnv
+      - fd-find
+      - fzf
+      - hyperfine
+      - jq
+      - mosh
+      - ncdu
+      - neovim
+      - netcat-openbsd
+      - ripgrep
+      - tealdeer
+      - tmux
+      - traceroute
+      - yq
+      - zoxide
+      - xclip
+
+  # Ubuntu installs bat as batcat and fd-find as fdfind; create ~/.local/bin shims.
+  - type: cmd
+    run: "mkdir -p $HOME/.local/bin && ln -sf /usr/bin/batcat $HOME/.local/bin/bat && ln -sf /usr/bin/fdfind $HOME/.local/bin/fd"
+    check: "test -L $HOME/.local/bin/bat && test -L $HOME/.local/bin/fd"
+
+  # ── Language tooling ─────────────────────────────────────────────────────────
+  - type: corepack
+    managers: [pnpm, yarn]
+
+  - type: rust_components
+    components: [clippy, rustfmt, rust-analyzer]
+
+  # uv itself (no dedicated sproot module yet; installs to ~/.local/bin)
+  - type: cmd
+    run: "curl -LsSf https://astral.sh/uv/install.sh | sh"
+    check: "test -x $HOME/.local/bin/uv"
+
+  # uv-managed tools: call uv by full path because the Go process PATH may not
+  # include ~/.local/bin until after the shell sources rc_additions.sh.
+  - type: cmd
+    run: "$HOME/.local/bin/uv tool install black"
+    check: "which black"
+
+  - type: cmd
+    run: "$HOME/.local/bin/uv tool install pre-commit"
+    check: "which pre-commit"
+
+  - type: cmd
+    run: "$HOME/.local/bin/uv tool install ruff"
+    check: "which ruff"
+
+  - type: cmd
+    run: "$HOME/.local/bin/uv tool install semgrep"
+    check: "which semgrep"
+
+  # garlic: package is garlic-cli but binary is garlic; uv_tool can't handle
+  # the package-name != binary-name case yet.
+  - type: cmd
+    run: "$HOME/.local/bin/uv tool install garlic-cli"
+    check: "which garlic"
+
+  # ── Security tools ───────────────────────────────────────────────────────────
+  - type: binary_release
+    name: cosign
+    repo: sigstore/cosign
+    asset: "cosign_{version}_{arch}.deb"
+    install: dpkg
+
+  # trufflehog uses a custom install script with cosign signature verification.
+  - type: cmd
+    run: "curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sudo sh -s -- -v -b /usr/local/bin"
+    check: "which trufflehog"
+
+  - type: binary_release
+    name: dive
+    repo: wagoodman/dive
+    asset: "dive_{version}_linux_{arch}.deb"
+    install: dpkg
+
+  # gitleaks releases use x64/arm64 naming; binary_release only knows amd64/arm64.
+  - type: cmd
+    run: |
+      LATEST=$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
+      ARCH=$(dpkg --print-architecture)
+      GL_ARCH=$([ "$ARCH" = "amd64" ] && echo x64 || echo arm64)
+      curl -fsSL -o /tmp/gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${LATEST}/gitleaks_${LATEST}_linux_${GL_ARCH}.tar.gz"
+      tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+      sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+      rm -f /tmp/gitleaks.tar.gz /tmp/gitleaks
+    check: "which gitleaks"
+
+  # hadolint releases use x86_64/arm64 naming; binary_release only knows amd64/arm64.
+  - type: cmd
+    run: |
+      LATEST=$(curl -fsSL https://api.github.com/repos/hadolint/hadolint/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
+      ARCH=$(dpkg --print-architecture)
+      HL_ARCH=$([ "$ARCH" = "amd64" ] && echo x86_64 || echo arm64)
+      curl -fsSL -o /tmp/hadolint "https://github.com/hadolint/hadolint/releases/download/v${LATEST}/hadolint-Linux-${HL_ARCH}"
+      sudo install -m 0755 /tmp/hadolint /usr/local/bin/hadolint
+      rm -f /tmp/hadolint
+    check: "which hadolint"
+
+  # ── Docker ───────────────────────────────────────────────────────────────────
+  - type: docker
+
+  # docker module does not write daemon.json; handle it separately.
+  - type: cmd
+    run: "sudo mkdir -p /etc/docker && printf '{\"log-driver\":\"json-file\",\"log-opts\":{\"max-size\":\"20m\",\"max-file\":\"5\"},\"live-restore\":true}\n' | sudo tee /etc/docker/daemon.json > /dev/null"
+    check: "test -f /etc/docker/daemon.json"
+
+  - type: sprite_service
+    service: dockerd
+    cmd: /usr/bin/dockerd
+
+  # ── CLI tools ────────────────────────────────────────────────────────────────
+  - type: cmd
+    run: "curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive"
+    check: "which flyctl"
+
+  # ── Claude Code ──────────────────────────────────────────────────────────────
+  - type: cmd
+    run: "claude upgrade"
+
+  - type: file_template
+    src: files/statusline.py
+    dest: ~/.claude/statusline.py
+    mode: "0755"
+
+  - type: claude_settings
+    settings:
+      permissions:
+        defaultMode: bypassPermissions
+      tui: fullscreen
+      skipDangerousModePermissionPrompt: true
+      theme: dark
+      statusLine:
+        type: command
+        command: "python3 /home/sprite/.claude/statusline.py"
+
+  # ── Dotfiles ─────────────────────────────────────────────────────────────────
+  - type: file_template
+    src: files/pre-commit-config.template.yaml
+    dest: ~/.config/pre-commit/.pre-commit-config.template.yaml
+    mode: "0644"
+
+  - type: file_template
+    src: files/gitignore_global
+    dest: ~/.gitignore_global
+    mode: "0644"
+
+  # ── SSH / GitHub / Git identity ──────────────────────────────────────────────
+  # ssh_setup: generates ed25519 keypair, populates known_hosts, registers auth
+  # and signing keys with GitHub using GH_TOKEN.
+  - type: ssh_setup
+
+  # gh_token: pipes GH_TOKEN to `gh auth login --with-token --git-protocol ssh`
+  # so subsequent gh commands work without a token in the environment.
+  - type: gh_token
+
+  # git_identity: sets name/email/branch + extra git config. Also sets SSH
+  # commit signing config if ~/.ssh/id_ed25519.pub exists (i.e. after ssh_setup).
+  - type: git_identity
+    config:
+      pull.rebase: "true"
+      push.autoSetupRemote: "true"
+      rerere.enabled: "true"
+      color.ui: auto
+      core.editor: vim
+      fetch.prune: "true"
+      core.excludesFile: "~/.gitignore_global"
+      alias.lg: "log --oneline --graph --decorate --all"
+      alias.last: "log -1 HEAD"
+      alias.amend: "commit --amend --no-edit"
+      alias.unstage: "reset HEAD --"
+      alias.cleanb: "!git branch --merged | grep -vE '^\\*|^.\\s*(main|master|develop)$' | xargs -r git branch -d"
+
+  # ── Repos ────────────────────────────────────────────────────────────────────
+  - type: repo_clone
+    base_dir: ~/repos
+    repos:
+      - justanotherspy/garlic
+      - justanotherspy/poker
+      - justanotherspy/sprite
+      - justanotherspy/justanotherspy.com
+
+  - type: cmd
+    run: "mkdir -p $HOME/.config/sproot && garlic setup --defaults -y && date -u > $HOME/.config/sproot/garlic-defaults.applied"
+    check: "test -f $HOME/.config/sproot/garlic-defaults.applied"
+
+  # ── Shell environment ────────────────────────────────────────────────────────
+  - type: file_template
+    src: files/ps1.sh
+    dest: ~/.local/share/sprite-setup/ps1.sh
+    mode: "0644"
+
+  - type: cmd
+    run: |
+      mkdir -p $HOME/.zsh/completions
+      for pair in "gh:gh completion -s zsh" "flyctl:flyctl completion zsh" "uv:$HOME/.local/bin/uv generate-shell-completion zsh" "cosign:cosign completion zsh"; do
+        tool="${pair%%:*}"; cmd="${pair#*:}"; dest="$HOME/.zsh/completions/_${tool}"
+        [ -f "$dest" ] && continue
+        command -v "${cmd%% *}" >/dev/null 2>&1 && eval "$cmd" > "$dest" 2>/dev/null || rm -f "$dest"
+      done
+    check: "test -d $HOME/.zsh/completions"
+
+  - type: rc_block
+    src: files/rc_additions.sh
