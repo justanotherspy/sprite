@@ -1,4 +1,4 @@
-# sprite
+# 👾 sprite
 
 Personal dev-environment config repo for [sprite.dev](https://sprite.dev) sprites,
 driven by [sproot](https://github.com/justanotherspy/sproot).
