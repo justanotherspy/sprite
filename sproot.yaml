@@ -13,6 +13,8 @@ env:
 
 phases:
   # ── System packages ──────────────────────────────────────────────────────────
+  # Ubuntu ships bat as batcat and fd-find as fdfind; the apt module's symlinks
+  # field exposes them under the expected names in ~/.local/bin.
   - type: apt
     packages:
       - apt-transport-https
@@ -37,11 +39,11 @@ phases:
       - yq
       - zoxide
       - xclip
-
-  # Ubuntu installs bat as batcat and fd-find as fdfind; create ~/.local/bin shims.
-  - type: cmd
-    run: "mkdir -p $HOME/.local/bin && ln -sf /usr/bin/batcat $HOME/.local/bin/bat && ln -sf /usr/bin/fdfind $HOME/.local/bin/fd"
-    check: "test -L $HOME/.local/bin/bat && test -L $HOME/.local/bin/fd"
+    symlinks:
+      - from: /usr/bin/batcat
+        to: ~/.local/bin/bat
+      - from: /usr/bin/fdfind
+        to: ~/.local/bin/fd
 
   # ── Language tooling ─────────────────────────────────────────────────────────
   - type: corepack
@@ -50,103 +52,94 @@ phases:
   - type: rust_components
     components: [clippy, rustfmt, rust-analyzer]
 
-  # uv itself (no dedicated sproot module yet; installs to ~/.local/bin)
-  - type: cmd
-    run: "curl -LsSf https://astral.sh/uv/install.sh | sh"
-    check: "test -x $HOME/.local/bin/uv"
-
-  # uv-managed tools: call uv by full path because the Go process PATH may not
-  # include ~/.local/bin until after the shell sources rc_additions.sh.
-  - type: cmd
-    run: "$HOME/.local/bin/uv tool install black"
-    check: "which black"
-
-  - type: cmd
-    run: "$HOME/.local/bin/uv tool install pre-commit"
-    check: "which pre-commit"
-
-  - type: cmd
-    run: "$HOME/.local/bin/uv tool install ruff"
-    check: "which ruff"
-
-  - type: cmd
-    run: "$HOME/.local/bin/uv tool install semgrep"
-    check: "which semgrep"
-
-  # garlic: package is garlic-cli but binary is garlic; uv_tool can't handle
-  # the package-name != binary-name case yet.
-  - type: cmd
-    run: "$HOME/.local/bin/uv tool install garlic-cli"
-    check: "which garlic"
+  # uv_tool installs uv itself (to /usr/local/bin) if it is not already on PATH,
+  # then installs each tool. garlic's PyPI package (garlic-cli) differs from its
+  # binary name, hence the pkg override.
+  - type: uv_tool
+    tools:
+      - name: black
+      - name: pre-commit
+      - name: ruff
+      - name: semgrep
+      - name: garlic
+        pkg: garlic-cli
 
   # ── Security tools ───────────────────────────────────────────────────────────
+  # cosign first: trufflehog's release is keyless-cosign verified below.
   - type: binary_release
     name: cosign
     repo: sigstore/cosign
+    version: "{tag_no_v}"
     asset: "cosign_{version}_{arch}.deb"
     install: dpkg
 
-  # trufflehog uses a custom install script with cosign signature verification.
-  - type: cmd
-    run: "curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sudo sh -s -- -v -b /usr/local/bin"
-    check: "which trufflehog"
+  - type: binary_release
+    name: trufflehog
+    repo: trufflesecurity/trufflehog
+    version: "{tag_no_v}"
+    asset: "trufflehog_{version}_linux_{arch}.tar.gz"
+    checksum_asset: "trufflehog_{version}_checksums.txt"
+    install: tar+install
+    cosign:
+      blob: "trufflehog_{version}_checksums.txt"
+      signature: "trufflehog_{version}_checksums.txt.sig"
+      certificate: "trufflehog_{version}_checksums.txt.pem"
+      certificate_oidc_issuer: "https://token.actions.githubusercontent.com"
+      certificate_identity_regexp: "https://github.com/trufflesecurity/trufflehog/.github/workflows/.*"
 
   - type: binary_release
     name: dive
     repo: wagoodman/dive
+    version: "{tag_no_v}"
     asset: "dive_{version}_linux_{arch}.deb"
     install: dpkg
 
-  # gitleaks releases use x64/arm64 naming; binary_release only knows amd64/arm64.
-  - type: cmd
-    run: |
-      LATEST=$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
-      ARCH=$(dpkg --print-architecture)
-      GL_ARCH=$([ "$ARCH" = "amd64" ] && echo x64 || echo arm64)
-      curl -fsSL -o /tmp/gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${LATEST}/gitleaks_${LATEST}_linux_${GL_ARCH}.tar.gz"
-      tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
-      sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
-      rm -f /tmp/gitleaks.tar.gz /tmp/gitleaks
-    check: "which gitleaks"
+  # gitleaks names its tarball arch x64/arm64 -> {x64_arch}.
+  - type: binary_release
+    name: gitleaks
+    repo: gitleaks/gitleaks
+    version: "{tag_no_v}"
+    asset: "gitleaks_{version}_linux_{x64_arch}.tar.gz"
+    install: tar+install
 
-  # hadolint releases use x86_64/arm64 naming; binary_release only knows amd64/arm64.
-  - type: cmd
-    run: |
-      LATEST=$(curl -fsSL https://api.github.com/repos/hadolint/hadolint/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
-      ARCH=$(dpkg --print-architecture)
-      HL_ARCH=$([ "$ARCH" = "amd64" ] && echo x86_64 || echo arm64)
-      curl -fsSL -o /tmp/hadolint "https://github.com/hadolint/hadolint/releases/download/v${LATEST}/hadolint-Linux-${HL_ARCH}"
-      sudo install -m 0755 /tmp/hadolint /usr/local/bin/hadolint
-      rm -f /tmp/hadolint
-    check: "which hadolint"
+  # hadolint ships a bare binary named x86_64 on amd64 but arm64 on arm64, which
+  # matches no built-in arch token, so map it explicitly via {arch_alias}.
+  - type: binary_release
+    name: hadolint
+    repo: hadolint/hadolint
+    asset: "hadolint-Linux-{arch_alias}"
+    install: raw
+    arch_map:
+      amd64: x86_64
+      arm64: arm64
 
   # ── Docker ───────────────────────────────────────────────────────────────────
   - type: docker
-
-  # docker module does not write daemon.json; handle it separately.
-  - type: cmd
-    run: "sudo mkdir -p /etc/docker && printf '{\"log-driver\":\"json-file\",\"log-opts\":{\"max-size\":\"20m\",\"max-file\":\"5\"},\"live-restore\":true}\n' | sudo tee /etc/docker/daemon.json > /dev/null"
-    check: "test -f /etc/docker/daemon.json"
+    daemon_json:
+      log-driver: json-file
+      log-opts:
+        max-size: "20m"
+        max-file: "5"
+      live-restore: true
 
   - type: sprite_service
     service: dockerd
     cmd: /usr/bin/dockerd
 
   # ── CLI tools ────────────────────────────────────────────────────────────────
+  # flyctl's official installer is a curl|sh script; no GitHub-release module fits.
   - type: cmd
     run: "curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive"
     check: "which flyctl"
 
   # ── Claude Code ──────────────────────────────────────────────────────────────
-  - type: cmd
-    run: "claude upgrade"
-
   - type: file_template
     src: files/statusline.py
     dest: ~/.claude/statusline.py
     mode: "0755"
 
-  - type: claude_settings
+  - type: claude
+    upgrade: true
     settings:
       permissions:
         defaultMode: bypassPermissions
@@ -216,7 +209,7 @@ phases:
   - type: cmd
     run: |
       mkdir -p $HOME/.zsh/completions
-      for pair in "gh:gh completion -s zsh" "flyctl:flyctl completion zsh" "uv:$HOME/.local/bin/uv generate-shell-completion zsh" "cosign:cosign completion zsh"; do
+      for pair in "gh:gh completion -s zsh" "flyctl:flyctl completion zsh" "uv:uv generate-shell-completion zsh" "cosign:cosign completion zsh"; do
         tool="${pair%%:*}"; cmd="${pair#*:}"; dest="$HOME/.zsh/completions/_${tool}"
         [ -f "$dest" ] && continue
         command -v "${cmd%% *}" >/dev/null 2>&1 && eval "$cmd" > "$dest" 2>/dev/null || rm -f "$dest"
