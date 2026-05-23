@@ -127,12 +127,13 @@ phases:
   # ── CLI tools ────────────────────────────────────────────────────────────────
   # flyctl's official installer is a curl|sh script; no GitHub-release module fits.
   - type: cmd
-    run: "curl -fsSL https://fly.io/install.sh | sh -s -- --non-interactive"
+    run: "curl -fsSL https://fly.io/install.sh | FLYCTL_INSTALL=$HOME/.local sh -s -- --non-interactive"
     check: "which flyctl"
 
   - type: cargo_install
     tools:
       - name: garlic-ward
+        bin: garlic
 
   # ── Claude Code ──────────────────────────────────────────────────────────────
   - type: file_template
