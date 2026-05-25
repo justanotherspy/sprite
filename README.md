@@ -18,16 +18,35 @@ sproot new my-sprite
 sproot will create a fresh sprite, inject itself into it, clone this repo as the
 config repo, and run `sproot setup` end-to-end.
 
+## Configurations (targets)
+
+`sproot.yaml` defines named **targets** for different scenarios. Pick one with
+`--target`; with none, `default` runs.
+
+| Target | What you get |
+|--------|--------------|
+| `default` | My personal dev sprite: the full toolchain below. |
+| `nix` | Everything in `default`, plus the [Nix](https://docs.determinate.systems/) package manager (Determinate Nix, nix-daemon as a sprite service) and a couple of nix-provided tools. `extends: default`. |
+
+```bash
+sproot new my-sprite              # default
+sproot new my-nix-sprite --target nix
+```
+
+`extends` lets the `nix` target inherit every `default` phase verbatim and append
+the `nix` module, so the shared toolchain is defined once.
+
 ## Config repo layout
 
 ```
-sproot.yaml                          phase list and identity
+sproot.yaml                          targets, phase lists, and identity
 files/
   statusline.py                      Claude Code status line script
   ps1.sh                             custom bash/zsh prompt
   rc_additions.sh                    shell rc block (aliases, PATH, direnv, etc.)
   gitignore_global                   ~/.gitignore_global content
   pre-commit-config.template.yaml    starter pre-commit config for new repos
+  nix-setup.sh                       nix target: flake/home-manager escape hatch
 MIGRATION.md                         notes on the conversion from setup.sh
 ```
 
